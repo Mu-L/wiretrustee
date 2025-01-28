@@ -1,18 +1,21 @@
 package server
 
 import (
-	"github.com/netbirdio/netbird/management/proto"
+	"context"
 	"testing"
+	"time"
+
+	"github.com/netbirdio/netbird/management/proto"
 )
 
-var peersUpdater *PeersUpdateManager
+// var peersUpdater *PeersUpdateManager
 
 func TestCreateChannel(t *testing.T) {
 	peer := "test-create"
-	peersUpdater = NewPeersUpdateManager()
-	defer peersUpdater.CloseChannel(peer)
+	peersUpdater := NewPeersUpdateManager(nil)
+	defer peersUpdater.CloseChannel(context.Background(), peer)
 
-	_ = peersUpdater.CreateChannel(peer)
+	_ = peersUpdater.CreateChannel(context.Background(), peer)
 	if _, ok := peersUpdater.peerChannels[peer]; !ok {
 		t.Error("Error creating the channel")
 	}
@@ -20,29 +23,56 @@ func TestCreateChannel(t *testing.T) {
 
 func TestSendUpdate(t *testing.T) {
 	peer := "test-sendupdate"
-	update := &UpdateMessage{Update: &proto.SyncResponse{}}
-	_ = peersUpdater.CreateChannel(peer)
+	peersUpdater := NewPeersUpdateManager(nil)
+	update1 := &UpdateMessage{Update: &proto.SyncResponse{
+		NetworkMap: &proto.NetworkMap{
+			Serial: 0,
+		},
+	}}
+	_ = peersUpdater.CreateChannel(context.Background(), peer)
 	if _, ok := peersUpdater.peerChannels[peer]; !ok {
 		t.Error("Error creating the channel")
 	}
-	err := peersUpdater.SendUpdate(peer, update)
-	if err != nil {
-		t.Error("Error sending update: ", err)
-	}
+	peersUpdater.SendUpdate(context.Background(), peer, update1)
 	select {
 	case <-peersUpdater.peerChannels[peer]:
 	default:
 		t.Error("Update wasn't send")
 	}
+
+	for range [channelBufferSize]int{} {
+		peersUpdater.SendUpdate(context.Background(), peer, update1)
+	}
+
+	update2 := &UpdateMessage{Update: &proto.SyncResponse{
+		NetworkMap: &proto.NetworkMap{
+			Serial: 10,
+		},
+	}}
+
+	peersUpdater.SendUpdate(context.Background(), peer, update2)
+	timeout := time.After(5 * time.Second)
+	for range [channelBufferSize]int{} {
+		select {
+		case <-timeout:
+			t.Error("timed out reading previously sent updates")
+		case updateReader := <-peersUpdater.peerChannels[peer]:
+			if updateReader.Update.NetworkMap.Serial == update2.Update.NetworkMap.Serial {
+				t.Error("got the update that shouldn't have been sent")
+			}
+		}
+	}
+
 }
 
 func TestCloseChannel(t *testing.T) {
 	peer := "test-close"
-	_ = peersUpdater.CreateChannel(peer)
+	peersUpdater := NewPeersUpdateManager(nil)
+	_ = peersUpdater.CreateChannel(context.Background(), peer)
 	if _, ok := peersUpdater.peerChannels[peer]; !ok {
 		t.Error("Error creating the channel")
 	}
-	peersUpdater.CloseChannel(peer)
+	peersUpdater.CloseChannel(context.Background(), peer)
 	if _, ok := peersUpdater.peerChannels[peer]; ok {
 		t.Error("Error closing the channel")
 	}

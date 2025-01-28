@@ -11,16 +11,17 @@ import (
 	"github.com/kardianos/service"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+
 	"github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/client/server"
 	"github.com/netbirdio/netbird/util"
-	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
 )
 
 func (p *program) Start(svc service.Service) error {
 	// Start should not block. Do the actual work async.
-	log.Info("starting service") //nolint
+	log.Info("starting Netbird service") //nolint
 	// in any case, even if configuration does not exists we run daemon to serve CLI gRPC API.
 	p.serv = grpc.NewServer()
 
@@ -54,11 +55,15 @@ func (p *program) Start(svc service.Service) error {
 			}
 		}
 
-		serverInstance := server.New(p.ctx, managementURL, adminURL, configPath, logFile)
+		serverInstance := server.New(p.ctx, configPath, logFile)
 		if err := serverInstance.Start(); err != nil {
 			log.Fatalf("failed to start daemon: %v", err)
 		}
 		proto.RegisterDaemonServiceServer(p.serv, serverInstance)
+
+		p.serverInstanceMu.Lock()
+		p.serverInstance = serverInstance
+		p.serverInstanceMu.Unlock()
 
 		log.Printf("started daemon server: %v", split[1])
 		if err := p.serv.Serve(listen); err != nil {
@@ -69,6 +74,16 @@ func (p *program) Start(svc service.Service) error {
 }
 
 func (p *program) Stop(srv service.Service) error {
+	p.serverInstanceMu.Lock()
+	if p.serverInstance != nil {
+		in := new(proto.DownRequest)
+		_, err := p.serverInstance.Down(p.ctx, in)
+		if err != nil {
+			log.Errorf("failed to stop daemon: %v", err)
+		}
+	}
+	p.serverInstanceMu.Unlock()
+
 	p.cancel()
 
 	if p.serv != nil {
@@ -84,7 +99,7 @@ var runCmd = &cobra.Command{
 	Use:   "run",
 	Short: "runs Netbird as service",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		SetFlagsFromEnvVars()
+		SetFlagsFromEnvVars(rootCmd)
 
 		cmd.SetOut(cmd.OutOrStdout())
 
@@ -109,7 +124,6 @@ var runCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		cmd.Printf("Netbird service is running")
 		return nil
 	},
 }
@@ -118,7 +132,7 @@ var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "starts Netbird service",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		SetFlagsFromEnvVars()
+		SetFlagsFromEnvVars(rootCmd)
 
 		cmd.SetOut(cmd.OutOrStdout())
 
@@ -153,7 +167,7 @@ var stopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "stops Netbird service",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		SetFlagsFromEnvVars()
+		SetFlagsFromEnvVars(rootCmd)
 
 		cmd.SetOut(cmd.OutOrStdout())
 
@@ -186,7 +200,7 @@ var restartCmd = &cobra.Command{
 	Use:   "restart",
 	Short: "restarts Netbird service",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		SetFlagsFromEnvVars()
+		SetFlagsFromEnvVars(rootCmd)
 
 		cmd.SetOut(cmd.OutOrStdout())
 

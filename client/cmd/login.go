@@ -3,24 +3,27 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/skratchdot/open-golang/open"
-	"google.golang.org/grpc/codes"
-	gstatus "google.golang.org/grpc/status"
+	"os"
+	"strings"
 	"time"
 
-	"github.com/netbirdio/netbird/util"
-
+	"github.com/skratchdot/open-golang/open"
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	gstatus "google.golang.org/grpc/status"
 
 	"github.com/netbirdio/netbird/client/internal"
+	"github.com/netbirdio/netbird/client/internal/auth"
 	"github.com/netbirdio/netbird/client/proto"
+	"github.com/netbirdio/netbird/client/system"
+	"github.com/netbirdio/netbird/util"
 )
 
 var loginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "login to the Netbird Management Service (first run)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		SetFlagsFromEnvVars()
+		SetFlagsFromEnvVars(rootCmd)
 
 		cmd.SetOut(cmd.OutOrStdout())
 
@@ -31,6 +34,16 @@ var loginCmd = &cobra.Command{
 
 		ctx := internal.CtxInitState(context.Background())
 
+		if hostName != "" {
+			// nolint
+			ctx = context.WithValue(ctx, system.DeviceNameCtxKey, hostName)
+		}
+
+		providedSetupKey, err := getSetupKey()
+		if err != nil {
+			return err
+		}
+
 		// workaround to run without service
 		if logFile == "console" {
 			err = handleRebrand(cmd)
@@ -38,12 +51,23 @@ var loginCmd = &cobra.Command{
 				return err
 			}
 
-			config, err := internal.GetConfig(managementURL, adminURL, configPath, preSharedKey)
+			ic := internal.ConfigInput{
+				ManagementURL: managementURL,
+				AdminURL:      adminURL,
+				ConfigPath:    configPath,
+			}
+			if rootCmd.PersistentFlags().Changed(preSharedKeyFlag) {
+				ic.PreSharedKey = &preSharedKey
+			}
+
+			config, err := internal.UpdateOrCreateConfig(ic)
 			if err != nil {
 				return fmt.Errorf("get config file: %v", err)
 			}
 
-			err = foregroundLogin(ctx, cmd, config, setupKey)
+			config, _ = internal.UpdateOldManagementURL(ctx, config, configPath)
+
+			err = foregroundLogin(ctx, cmd, config, providedSetupKey)
 			if err != nil {
 				return fmt.Errorf("foreground login failed: %v", err)
 			}
@@ -62,9 +86,14 @@ var loginCmd = &cobra.Command{
 		client := proto.NewDaemonServiceClient(conn)
 
 		loginRequest := proto.LoginRequest{
-			SetupKey:      setupKey,
-			PreSharedKey:  preSharedKey,
-			ManagementUrl: managementURL,
+			SetupKey:             providedSetupKey,
+			ManagementUrl:        managementURL,
+			IsLinuxDesktopClient: isLinuxRunningDesktop(),
+			Hostname:             hostName,
+		}
+
+		if rootCmd.PersistentFlags().Changed(preSharedKeyFlag) {
+			loginRequest.OptionalPreSharedKey = &preSharedKey
 		}
 
 		var loginErr error
@@ -92,9 +121,9 @@ var loginCmd = &cobra.Command{
 		}
 
 		if loginResp.NeedsSSOLogin {
-			openURL(cmd, loginResp.VerificationURI, loginResp.VerificationURIComplete, loginResp.UserCode)
+			openURL(cmd, loginResp.VerificationURIComplete, loginResp.UserCode)
 
-			_, err = client.WaitSSOLogin(ctx, &proto.WaitSSOLoginRequest{UserCode: loginResp.UserCode})
+			_, err = client.WaitSSOLogin(ctx, &proto.WaitSSOLoginRequest{UserCode: loginResp.UserCode, Hostname: hostName})
 			if err != nil {
 				return fmt.Errorf("waiting sso login failed with: %v", err)
 			}
@@ -127,16 +156,24 @@ func foregroundLogin(ctx context.Context, cmd *cobra.Command, config *internal.C
 		if err != nil {
 			return fmt.Errorf("interactive sso login failed: %v", err)
 		}
-		jwtToken = tokenInfo.AccessToken
+		jwtToken = tokenInfo.GetTokenToUse()
 	}
+
+	var lastError error
 
 	err = WithBackOff(func() error {
 		err := internal.Login(ctx, config, setupKey, jwtToken)
 		if s, ok := gstatus.FromError(err); ok && (s.Code() == codes.InvalidArgument || s.Code() == codes.PermissionDenied) {
+			lastError = err
 			return nil
 		}
 		return err
 	})
+
+	if lastError != nil {
+		return fmt.Errorf("login failed: %v", lastError)
+	}
+
 	if err != nil {
 		return fmt.Errorf("backoff cycle failed: %v", err)
 	}
@@ -144,44 +181,24 @@ func foregroundLogin(ctx context.Context, cmd *cobra.Command, config *internal.C
 	return nil
 }
 
-func foregroundGetTokenInfo(ctx context.Context, cmd *cobra.Command, config *internal.Config) (*internal.TokenInfo, error) {
-	providerConfig, err := internal.GetDeviceAuthorizationFlowInfo(ctx, config)
+func foregroundGetTokenInfo(ctx context.Context, cmd *cobra.Command, config *internal.Config) (*auth.TokenInfo, error) {
+	oAuthFlow, err := auth.NewOAuthFlow(ctx, config, isLinuxRunningDesktop())
 	if err != nil {
-		s, ok := gstatus.FromError(err)
-		if ok && s.Code() == codes.NotFound {
-			return nil, fmt.Errorf("no SSO provider returned from management. " +
-				"If you are using hosting Netbird see documentation at " +
-				"https://github.com/netbirdio/netbird/tree/main/management for details")
-		} else if ok && s.Code() == codes.Unimplemented {
-			mgmtURL := managementURL
-			if mgmtURL == "" {
-				mgmtURL = internal.ManagementURLDefault().String()
-			}
-			return nil, fmt.Errorf("the management server, %s, does not support SSO providers, "+
-				"please update your servver or use Setup Keys to login", mgmtURL)
-		} else {
-			return nil, fmt.Errorf("getting device authorization flow info failed with error: %v", err)
-		}
+		return nil, err
 	}
 
-	hostedClient := internal.NewHostedDeviceFlow(
-		providerConfig.ProviderConfig.Audience,
-		providerConfig.ProviderConfig.ClientID,
-		providerConfig.ProviderConfig.Domain,
-	)
-
-	flowInfo, err := hostedClient.RequestDeviceCode(context.TODO())
+	flowInfo, err := oAuthFlow.RequestAuthInfo(context.TODO())
 	if err != nil {
-		return nil, fmt.Errorf("getting a request device code failed: %v", err)
+		return nil, fmt.Errorf("getting a request OAuth flow info failed: %v", err)
 	}
 
-	openURL(cmd, flowInfo.VerificationURI, flowInfo.VerificationURIComplete, flowInfo.UserCode)
+	openURL(cmd, flowInfo.VerificationURIComplete, flowInfo.UserCode)
 
-	waitTimeout := time.Duration(flowInfo.ExpiresIn)
-	waitCTX, c := context.WithTimeout(context.TODO(), waitTimeout*time.Second)
+	waitTimeout := time.Duration(flowInfo.ExpiresIn) * time.Second
+	waitCTX, c := context.WithTimeout(context.TODO(), waitTimeout)
 	defer c()
 
-	tokenInfo, err := hostedClient.WaitToken(waitCTX, flowInfo)
+	tokenInfo, err := oAuthFlow.WaitToken(waitCTX, flowInfo)
 	if err != nil {
 		return nil, fmt.Errorf("waiting for browser login failed: %v", err)
 	}
@@ -189,13 +206,23 @@ func foregroundGetTokenInfo(ctx context.Context, cmd *cobra.Command, config *int
 	return &tokenInfo, nil
 }
 
-func openURL(cmd *cobra.Command, verificationURI, verificationURIComplete, userCode string) {
-	err := open.Run(verificationURIComplete)
-	if err != nil {
-		cmd.Println("Unable to open the default browser.")
-		cmd.Println("If this is not an interactive shell, you may want to use the setup key, see https://www.netbird.io/docs/overview/setup-keys")
-		cmd.Printf("Otherwise, you can continue the login flow by accessing the url below:\n\t%s\n", verificationURI)
-		cmd.Printf("Use the access code: %s\n", userCode)
-		cmd.Println("Or press CTRL + C or COMMAND + C")
+func openURL(cmd *cobra.Command, verificationURIComplete, userCode string) {
+	var codeMsg string
+	if userCode != "" && !strings.Contains(verificationURIComplete, userCode) {
+		codeMsg = fmt.Sprintf("and enter the code %s to authenticate.", userCode)
 	}
+
+	cmd.Println("Please do the SSO login in your browser. \n" +
+		"If your browser didn't open automatically, use this URL to log in:\n\n" +
+		verificationURIComplete + " " + codeMsg)
+	cmd.Println("")
+	if err := open.Run(verificationURIComplete); err != nil {
+		cmd.Println("\nAlternatively, you may want to use a setup key, see:\n\n" +
+			"https://docs.netbird.io/how-to/register-machines-using-setup-keys")
+	}
+}
+
+// isLinuxRunningDesktop checks if a Linux OS is running desktop environment
+func isLinuxRunningDesktop() bool {
+	return os.Getenv("DESKTOP_SESSION") != "" || os.Getenv("XDG_CURRENT_DESKTOP") != ""
 }
