@@ -1,28 +1,58 @@
 package idp
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/netbirdio/netbird/management/server/telemetry"
+)
+
+const (
+	// UnsetAccountID is a special key to map users without an account ID
+	UnsetAccountID = "unset"
 )
 
 // Manager idp manager interface
 type Manager interface {
-	UpdateUserAppMetadata(userId string, appMetadata AppMetadata) error
-	GetUserDataByID(userId string, appMetadata AppMetadata) (*UserData, error)
-	GetBatchedUserData(accountId string) ([]*UserData, error)
+	UpdateUserAppMetadata(ctx context.Context, userId string, appMetadata AppMetadata) error
+	GetUserDataByID(ctx context.Context, userId string, appMetadata AppMetadata) (*UserData, error)
+	GetAccount(ctx context.Context, accountId string) ([]*UserData, error)
+	GetAllAccounts(ctx context.Context) (map[string][]*UserData, error)
+	CreateUser(ctx context.Context, email, name, accountID, invitedByEmail string) (*UserData, error)
+	GetUserByEmail(ctx context.Context, email string) ([]*UserData, error)
+	InviteUserByID(ctx context.Context, userID string) error
+	DeleteUser(ctx context.Context, userID string) error
 }
+
+// ClientConfig defines common client configuration for all IdP manager
+type ClientConfig struct {
+	Issuer        string
+	TokenEndpoint string
+	ClientID      string
+	ClientSecret  string
+	GrantType     string
+}
+
+// ExtraConfig stores IdP specific config that are unique to individual IdPs
+type ExtraConfig map[string]string
 
 // Config an idp configuration struct to be loaded from management server's config file
 type Config struct {
-	ManagerType            string
-	Auth0ClientCredentials Auth0ClientConfig
+	ManagerType               string
+	ClientConfig              *ClientConfig
+	ExtraConfig               ExtraConfig
+	Auth0ClientCredentials    *Auth0ClientConfig
+	AzureClientCredentials    *AzureClientConfig
+	KeycloakClientCredentials *KeycloakClientConfig
+	ZitadelClientCredentials  *ZitadelClientConfig
 }
 
 // ManagerCredentials interface that authenticates using the credential of each type of idp
 type ManagerCredentials interface {
-	Authenticate() (JWTToken, error)
+	Authenticate(ctx context.Context) (JWTToken, error)
 }
 
 // ManagerHTTPClient http client interface for API calls
@@ -37,16 +67,19 @@ type ManagerHelper interface {
 }
 
 type UserData struct {
-	Email string `json:"email"`
-	Name  string `json:"name"`
-	ID    string `json:"user_id"`
+	Email       string      `json:"email"`
+	Name        string      `json:"name"`
+	ID          string      `json:"user_id"`
+	AppMetadata AppMetadata `json:"app_metadata"`
 }
 
 // AppMetadata user app metadata to associate with a profile
 type AppMetadata struct {
-	// Wiretrustee account id to update in the IDP
+	// WTAccountID is a NetBird (previously Wiretrustee) account id to update in the IDP
 	// maps to wt_account_id when json.marshal
-	WTAccountId string `json:"wt_account_id"`
+	WTAccountID     string `json:"wt_account_id,omitempty"`
+	WTPendingInvite *bool  `json:"wt_pending_invite,omitempty"`
+	WTInvitedBy     string `json:"wt_invited_by_email,omitempty"`
 }
 
 // JWTToken a JWT object that holds information of a token
@@ -59,12 +92,97 @@ type JWTToken struct {
 }
 
 // NewManager returns a new idp manager based on the configuration that it receives
-func NewManager(config Config) (Manager, error) {
+func NewManager(ctx context.Context, config Config, appMetrics telemetry.AppMetrics) (Manager, error) {
+	if config.ClientConfig != nil {
+		config.ClientConfig.Issuer = strings.TrimSuffix(config.ClientConfig.Issuer, "/")
+	}
+
 	switch strings.ToLower(config.ManagerType) {
 	case "none", "":
-		return nil, nil
+		return nil, nil //nolint:nilnil
 	case "auth0":
-		return NewAuth0Manager(config.Auth0ClientCredentials)
+		auth0ClientConfig := config.Auth0ClientCredentials
+		if config.ClientConfig != nil {
+			auth0ClientConfig = &Auth0ClientConfig{
+				Audience:     config.ExtraConfig["Audience"],
+				AuthIssuer:   config.ClientConfig.Issuer,
+				ClientID:     config.ClientConfig.ClientID,
+				ClientSecret: config.ClientConfig.ClientSecret,
+				GrantType:    config.ClientConfig.GrantType,
+			}
+		}
+
+		return NewAuth0Manager(*auth0ClientConfig, appMetrics)
+	case "azure":
+		azureClientConfig := config.AzureClientCredentials
+		if config.ClientConfig != nil {
+			azureClientConfig = &AzureClientConfig{
+				ClientID:         config.ClientConfig.ClientID,
+				ClientSecret:     config.ClientConfig.ClientSecret,
+				GrantType:        config.ClientConfig.GrantType,
+				TokenEndpoint:    config.ClientConfig.TokenEndpoint,
+				ObjectID:         config.ExtraConfig["ObjectId"],
+				GraphAPIEndpoint: config.ExtraConfig["GraphApiEndpoint"],
+			}
+		}
+
+		return NewAzureManager(*azureClientConfig, appMetrics)
+	case "keycloak":
+		keycloakClientConfig := config.KeycloakClientCredentials
+		if config.ClientConfig != nil {
+			keycloakClientConfig = &KeycloakClientConfig{
+				ClientID:      config.ClientConfig.ClientID,
+				ClientSecret:  config.ClientConfig.ClientSecret,
+				GrantType:     config.ClientConfig.GrantType,
+				TokenEndpoint: config.ClientConfig.TokenEndpoint,
+				AdminEndpoint: config.ExtraConfig["AdminEndpoint"],
+			}
+		}
+
+		return NewKeycloakManager(*keycloakClientConfig, appMetrics)
+	case "zitadel":
+		zitadelClientConfig := config.ZitadelClientCredentials
+		if config.ClientConfig != nil {
+			zitadelClientConfig = &ZitadelClientConfig{
+				ClientID:           config.ClientConfig.ClientID,
+				ClientSecret:       config.ClientConfig.ClientSecret,
+				GrantType:          config.ClientConfig.GrantType,
+				TokenEndpoint:      config.ClientConfig.TokenEndpoint,
+				ManagementEndpoint: config.ExtraConfig["ManagementEndpoint"],
+				PAT:                config.ExtraConfig["PAT"],
+			}
+		}
+
+		return NewZitadelManager(*zitadelClientConfig, appMetrics)
+	case "authentik":
+		authentikConfig := AuthentikClientConfig{
+			Issuer:        config.ClientConfig.Issuer,
+			ClientID:      config.ClientConfig.ClientID,
+			TokenEndpoint: config.ClientConfig.TokenEndpoint,
+			GrantType:     config.ClientConfig.GrantType,
+			Username:      config.ExtraConfig["Username"],
+			Password:      config.ExtraConfig["Password"],
+		}
+		return NewAuthentikManager(authentikConfig, appMetrics)
+	case "okta":
+		oktaClientConfig := OktaClientConfig{
+			Issuer:        config.ClientConfig.Issuer,
+			TokenEndpoint: config.ClientConfig.TokenEndpoint,
+			GrantType:     config.ClientConfig.GrantType,
+			APIToken:      config.ExtraConfig["ApiToken"],
+		}
+		return NewOktaManager(oktaClientConfig, appMetrics)
+	case "google":
+		googleClientConfig := GoogleWorkspaceClientConfig{
+			ServiceAccountKey: config.ExtraConfig["ServiceAccountKey"],
+			CustomerID:        config.ExtraConfig["CustomerId"],
+		}
+		return NewGoogleWorkspaceManager(ctx, googleClientConfig, appMetrics)
+	case "jumpcloud":
+		jumpcloudConfig := JumpCloudClientConfig{
+			APIToken: config.ExtraConfig["ApiToken"],
+		}
+		return NewJumpCloudManager(jumpcloudConfig, appMetrics)
 	default:
 		return nil, fmt.Errorf("invalid manager type: %s", config.ManagerType)
 	}

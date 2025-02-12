@@ -3,43 +3,53 @@ package client
 import (
 	"context"
 	"net"
-	"path/filepath"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/netbirdio/netbird/management/server/activity"
+	"github.com/netbirdio/netbird/management/server/settings"
+	"github.com/netbirdio/netbird/management/server/store"
+	"github.com/netbirdio/netbird/management/server/telemetry"
+
 	"github.com/netbirdio/netbird/client/system"
 
-	"github.com/netbirdio/netbird/encryption"
-	"github.com/netbirdio/netbird/management/proto"
-	mgmtProto "github.com/netbirdio/netbird/management/proto"
-	mgmt "github.com/netbirdio/netbird/management/server"
-	"github.com/netbirdio/netbird/management/server/mock_server"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/netbirdio/netbird/util"
+	"github.com/netbirdio/management-integrations/integrations"
+
+	"github.com/netbirdio/netbird/encryption"
+	mgmtProto "github.com/netbirdio/netbird/management/proto"
+	mgmt "github.com/netbirdio/netbird/management/server"
+	"github.com/netbirdio/netbird/management/server/mock_server"
+
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/netbirdio/netbird/util"
 )
 
 const ValidKey = "A2C8E62B-38F5-4553-B31E-DD66C696CEBB"
 
+func TestMain(m *testing.M) {
+	_ = util.InitLog("debug", "console")
+	code := m.Run()
+	os.Exit(code)
+}
+
 func startManagement(t *testing.T) (*grpc.Server, net.Listener) {
+	t.Helper()
 	level, _ := log.ParseLevel("debug")
 	log.SetLevel(level)
 
-	testDir := t.TempDir()
-
 	config := &mgmt.Config{}
 	_, err := util.ReadJson("../server/testdata/management.json", config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	config.Datadir = testDir
-	err = util.CopyFileContents("../server/testdata/store.json", filepath.Join(testDir, "store.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,18 +59,26 @@ func startManagement(t *testing.T) (*grpc.Server, net.Listener) {
 		t.Fatal(err)
 	}
 	s := grpc.NewServer()
-	store, err := mgmt.NewStore(config.Datadir)
+	store, cleanUp, err := store.NewTestStoreFromSQL(context.Background(), "../server/testdata/store.sql", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cleanUp)
+
+	peersUpdateManager := mgmt.NewPeersUpdateManager(nil)
+	eventStore := &activity.InMemoryEventStore{}
+	ia, _ := integrations.NewIntegratedValidator(context.Background(), eventStore)
+
+	metrics, err := telemetry.NewDefaultAppMetrics(context.Background())
+	require.NoError(t, err)
+
+	accountManager, err := mgmt.BuildManager(context.Background(), store, peersUpdateManager, nil, "", "netbird.selfhosted", eventStore, nil, false, ia, metrics)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	peersUpdateManager := mgmt.NewPeersUpdateManager()
-	accountManager, err := mgmt.BuildManager(store, peersUpdateManager, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	turnManager := mgmt.NewTimeBasedAuthSecretsManager(peersUpdateManager, config.TURNConfig)
-	mgmtServer, err := mgmt.NewServer(config, accountManager, peersUpdateManager, turnManager)
+	secretsManager := mgmt.NewTimeBasedAuthSecretsManager(peersUpdateManager, config.TURNConfig, config.Relay)
+	mgmtServer, err := mgmt.NewServer(context.Background(), config, accountManager, settings.NewManager(store), peersUpdateManager, secretsManager, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +94,7 @@ func startManagement(t *testing.T) (*grpc.Server, net.Listener) {
 }
 
 func startMockManagement(t *testing.T) (*grpc.Server, net.Listener, *mock_server.ManagementServiceServerMock, wgtypes.Key) {
+	t.Helper()
 	lis, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatal(err)
@@ -89,8 +108,8 @@ func startMockManagement(t *testing.T) (*grpc.Server, net.Listener, *mock_server
 	}
 
 	mgmtMockServer := &mock_server.ManagementServiceServerMock{
-		GetServerKeyFunc: func(context.Context, *proto.Empty) (*proto.ServerKeyResponse, error) {
-			response := &proto.ServerKeyResponse{
+		GetServerKeyFunc: func(context.Context, *mgmtProto.Empty) (*mgmtProto.ServerKeyResponse, error) {
+			response := &mgmtProto.ServerKeyResponse{
 				Key: serverKey.PublicKey().String(),
 			}
 			return response, nil
@@ -158,12 +177,12 @@ func TestClient_LoginUnregistered_ShouldThrow_401(t *testing.T) {
 		t.Fatal(err)
 	}
 	sysInfo := system.GetInfo(context.TODO())
-	_, err = client.Login(*key, sysInfo)
+	_, err = client.Login(*key, sysInfo, nil)
 	if err == nil {
 		t.Error("expecting err on unregistered login, got nil")
 	}
 	if s, ok := status.FromError(err); !ok || s.Code() != codes.PermissionDenied {
-		t.Errorf("expecting err code %d denied on on unregistered login got %d", codes.PermissionDenied, s.Code())
+		t.Errorf("expecting err code %d denied on unregistered login got %d", codes.PermissionDenied, s.Code())
 	}
 }
 
@@ -186,7 +205,7 @@ func TestClient_LoginRegistered(t *testing.T) {
 		t.Error(err)
 	}
 	info := system.GetInfo(context.TODO())
-	resp, err := client.Register(*key, ValidKey, "", info)
+	resp, err := client.Register(*key, ValidKey, "", info, nil)
 	if err != nil {
 		t.Error(err)
 	}
@@ -216,7 +235,7 @@ func TestClient_Sync(t *testing.T) {
 	}
 
 	info := system.GetInfo(context.TODO())
-	_, err = client.Register(*serverKey, ValidKey, "", info)
+	_, err = client.Register(*serverKey, ValidKey, "", info, nil)
 	if err != nil {
 		t.Error(err)
 	}
@@ -232,7 +251,7 @@ func TestClient_Sync(t *testing.T) {
 	}
 
 	info = system.GetInfo(context.TODO())
-	_, err = remoteClient.Register(*serverKey, ValidKey, "", info)
+	_, err = remoteClient.Register(*serverKey, ValidKey, "", info, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +259,7 @@ func TestClient_Sync(t *testing.T) {
 	ch := make(chan *mgmtProto.SyncResponse, 1)
 
 	go func() {
-		err = client.Sync(func(msg *mgmtProto.SyncResponse) error {
+		err = client.Sync(context.Background(), info, func(msg *mgmtProto.SyncResponse) error {
 			ch <- msg
 			return nil
 		})
@@ -254,8 +273,8 @@ func TestClient_Sync(t *testing.T) {
 		if resp.GetPeerConfig() == nil {
 			t.Error("expecting non nil PeerConfig got nil")
 		}
-		if resp.GetWiretrusteeConfig() == nil {
-			t.Error("expecting non nil WiretrusteeConfig got nil")
+		if resp.GetNetbirdConfig() == nil {
+			t.Error("expecting non nil NetbirdConfig got nil")
 		}
 		if len(resp.GetRemotePeers()) != 1 {
 			t.Errorf("expecting RemotePeers size %d got %d", 1, len(resp.GetRemotePeers()))
@@ -278,7 +297,7 @@ func Test_SystemMetaDataFromClient(t *testing.T) {
 
 	testKey, err := wgtypes.GenerateKey()
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal(err)
 	}
 
 	serverAddr := lis.Addr().String()
@@ -286,27 +305,27 @@ func Test_SystemMetaDataFromClient(t *testing.T) {
 
 	testClient, err := NewClient(ctx, serverAddr, testKey, false)
 	if err != nil {
-		log.Fatalf("error while creating testClient: %v", err)
+		t.Fatalf("error while creating testClient: %v", err)
 	}
 
 	key, err := testClient.GetServerPublicKey()
 	if err != nil {
-		log.Fatalf("error while getting server public key from testclient, %v", err)
+		t.Fatalf("error while getting server public key from testclient, %v", err)
 	}
 
-	var actualMeta *proto.PeerSystemMeta
+	var actualMeta *mgmtProto.PeerSystemMeta
 	var actualValidKey string
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	mgmtMockServer.LoginFunc = func(ctx context.Context, msg *proto.EncryptedMessage) (*proto.EncryptedMessage, error) {
+	mgmtMockServer.LoginFunc = func(ctx context.Context, msg *mgmtProto.EncryptedMessage) (*mgmtProto.EncryptedMessage, error) {
 		peerKey, err := wgtypes.ParseKey(msg.GetWgPubKey())
 		if err != nil {
 			log.Warnf("error while parsing peer's Wireguard public key %s on Sync request.", msg.WgPubKey)
 			return nil, status.Errorf(codes.InvalidArgument, "provided wgPubKey %s is invalid", msg.WgPubKey)
 		}
 
-		loginReq := &proto.LoginRequest{}
+		loginReq := &mgmtProto.LoginRequest{}
 		err = encryption.DecryptMessage(peerKey, serverKey, msg.Body, loginReq)
 		if err != nil {
 			log.Fatal(err)
@@ -316,7 +335,7 @@ func Test_SystemMetaDataFromClient(t *testing.T) {
 		actualValidKey = loginReq.GetSetupKey()
 		wg.Done()
 
-		loginResp := &proto.LoginResponse{}
+		loginResp := &mgmtProto.LoginResponse{}
 		encryptedResp, err := encryption.EncryptMessage(peerKey, serverKey, loginResp)
 		if err != nil {
 			return nil, err
@@ -330,25 +349,81 @@ func Test_SystemMetaDataFromClient(t *testing.T) {
 	}
 
 	info := system.GetInfo(context.TODO())
-	_, err = testClient.Register(*key, ValidKey, "", info)
+	_, err = testClient.Register(*key, ValidKey, "", info, nil)
 	if err != nil {
 		t.Errorf("error while trying to register client: %v", err)
 	}
 
 	wg.Wait()
 
-	expectedMeta := &proto.PeerSystemMeta{
-		Hostname:           info.Hostname,
-		GoOS:               info.GoOS,
-		Kernel:             info.Kernel,
-		Core:               info.OSVersion,
-		Platform:           info.Platform,
-		OS:                 info.OS,
-		WiretrusteeVersion: info.WiretrusteeVersion,
+	protoNetAddr := make([]*mgmtProto.NetworkAddress, 0, len(info.NetworkAddresses))
+	for _, addr := range info.NetworkAddresses {
+		protoNetAddr = append(protoNetAddr, &mgmtProto.NetworkAddress{
+			NetIP: addr.NetIP.String(),
+			Mac:   addr.Mac,
+		})
+
+	}
+
+	expectedMeta := &mgmtProto.PeerSystemMeta{
+		Hostname:       info.Hostname,
+		GoOS:           info.GoOS,
+		Kernel:         info.Kernel,
+		Platform:       info.Platform,
+		OS:             info.OS,
+		Core:           info.OSVersion,
+		OSVersion:      info.OSVersion,
+		NetbirdVersion: info.NetbirdVersion,
+		KernelVersion:  info.KernelVersion,
+
+		NetworkAddresses: protoNetAddr,
+		SysSerialNumber:  info.SystemSerialNumber,
+		SysProductName:   info.SystemProductName,
+		SysManufacturer:  info.SystemManufacturer,
+		Environment:      &mgmtProto.Environment{Cloud: info.Environment.Cloud, Platform: info.Environment.Platform},
 	}
 
 	assert.Equal(t, ValidKey, actualValidKey)
-	assert.Equal(t, expectedMeta, actualMeta)
+	if !isEqual(expectedMeta, actualMeta) {
+		t.Errorf("expected and actual meta are not equal")
+	}
+}
+
+func isEqual(a, b *mgmtProto.PeerSystemMeta) bool {
+	if len(a.NetworkAddresses) != len(b.NetworkAddresses) {
+		return false
+	}
+
+	for _, addr := range a.GetNetworkAddresses() {
+		var found bool
+		for _, oAddr := range b.GetNetworkAddresses() {
+			if addr.GetMac() == oAddr.GetMac() && addr.GetNetIP() == oAddr.GetNetIP() {
+				found = true
+				continue
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	log.Infof("------")
+
+	return a.GetHostname() == b.GetHostname() &&
+		a.GetGoOS() == b.GetGoOS() &&
+		a.GetKernel() == b.GetKernel() &&
+		a.GetKernelVersion() == b.GetKernelVersion() &&
+		a.GetCore() == b.GetCore() &&
+		a.GetPlatform() == b.GetPlatform() &&
+		a.GetOS() == b.GetOS() &&
+		a.GetOSVersion() == b.GetOSVersion() &&
+		a.GetNetbirdVersion() == b.GetNetbirdVersion() &&
+		a.GetUiVersion() == b.GetUiVersion() &&
+		a.GetSysSerialNumber() == b.GetSysSerialNumber() &&
+		a.GetSysProductName() == b.GetSysProductName() &&
+		a.GetSysManufacturer() == b.GetSysManufacturer() &&
+		a.GetEnvironment().Cloud == b.GetEnvironment().Cloud &&
+		a.GetEnvironment().Platform == b.GetEnvironment().Platform
 }
 
 func Test_GetDeviceAuthorizationFlow(t *testing.T) {
@@ -357,7 +432,7 @@ func Test_GetDeviceAuthorizationFlow(t *testing.T) {
 
 	testKey, err := wgtypes.GenerateKey()
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal(err)
 	}
 
 	serverAddr := lis.Addr().String()
@@ -365,15 +440,15 @@ func Test_GetDeviceAuthorizationFlow(t *testing.T) {
 
 	client, err := NewClient(ctx, serverAddr, testKey, false)
 	if err != nil {
-		log.Fatalf("error while creating testClient: %v", err)
+		t.Fatalf("error while creating testClient: %v", err)
 	}
 
-	expectedFlowInfo := &proto.DeviceAuthorizationFlow{
+	expectedFlowInfo := &mgmtProto.DeviceAuthorizationFlow{
 		Provider:       0,
-		ProviderConfig: &proto.ProviderConfig{ClientID: "client"},
+		ProviderConfig: &mgmtProto.ProviderConfig{ClientID: "client"},
 	}
 
-	mgmtMockServer.GetDeviceAuthorizationFlowFunc = func(ctx context.Context, req *mgmtProto.EncryptedMessage) (*proto.EncryptedMessage, error) {
+	mgmtMockServer.GetDeviceAuthorizationFlowFunc = func(ctx context.Context, req *mgmtProto.EncryptedMessage) (*mgmtProto.EncryptedMessage, error) {
 		encryptedResp, err := encryption.EncryptMessage(serverKey, client.key, expectedFlowInfo)
 		if err != nil {
 			return nil, err
@@ -393,4 +468,50 @@ func Test_GetDeviceAuthorizationFlow(t *testing.T) {
 
 	assert.Equal(t, expectedFlowInfo.Provider, flowInfo.Provider, "provider should match")
 	assert.Equal(t, expectedFlowInfo.ProviderConfig.ClientID, flowInfo.ProviderConfig.ClientID, "provider configured client ID should match")
+}
+
+func Test_GetPKCEAuthorizationFlow(t *testing.T) {
+	s, lis, mgmtMockServer, serverKey := startMockManagement(t)
+	defer s.GracefulStop()
+
+	testKey, err := wgtypes.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverAddr := lis.Addr().String()
+	ctx := context.Background()
+
+	client, err := NewClient(ctx, serverAddr, testKey, false)
+	if err != nil {
+		t.Fatalf("error while creating testClient: %v", err)
+	}
+
+	expectedFlowInfo := &mgmtProto.PKCEAuthorizationFlow{
+		ProviderConfig: &mgmtProto.ProviderConfig{
+			ClientID:     "client",
+			ClientSecret: "secret",
+		},
+	}
+
+	mgmtMockServer.GetPKCEAuthorizationFlowFunc = func(ctx context.Context, req *mgmtProto.EncryptedMessage) (*mgmtProto.EncryptedMessage, error) {
+		encryptedResp, err := encryption.EncryptMessage(serverKey, client.key, expectedFlowInfo)
+		if err != nil {
+			return nil, err
+		}
+
+		return &mgmtProto.EncryptedMessage{
+			WgPubKey: serverKey.PublicKey().String(),
+			Body:     encryptedResp,
+			Version:  0,
+		}, nil
+	}
+
+	flowInfo, err := client.GetPKCEAuthorizationFlow(serverKey)
+	if err != nil {
+		t.Error("error while retrieving pkce auth flow information")
+	}
+
+	assert.Equal(t, expectedFlowInfo.ProviderConfig.ClientID, flowInfo.ProviderConfig.ClientID, "provider configured client ID should match")
+	assert.Equal(t, expectedFlowInfo.ProviderConfig.ClientSecret, flowInfo.ProviderConfig.ClientSecret, "provider configured client secret should match")
 }

@@ -1,4 +1,5 @@
-FROM gcr.io/distroless/base:debug
-ENV WT_LOG_FILE=console
-ENTRYPOINT [ "/go/bin/netbird","up"]
-COPY netbird /go/bin/netbird
+FROM alpine:3.21.0
+RUN apk add --no-cache ca-certificates iptables ip6tables
+ENV NB_FOREGROUND_MODE=true
+ENTRYPOINT [ "/usr/local/bin/netbird","up"]
+COPY netbird /usr/local/bin/netbird

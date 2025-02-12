@@ -132,6 +132,7 @@ tls-listening-port=5349
 #external-ip=60.70.80.91/172.17.19.101
 #external-ip=60.70.80.92/172.17.19.102
 
+$TURN_EXTERNAL_IP_CONFIG
 
 # Number of the relay threads to handle the established connections
 # (in addition to authentication thread and the listener thread).
@@ -677,7 +678,7 @@ no-cli
 #
 #cli-password=$5$79a316b350311570$81df9cfb9af7f5e5a76eada31e7097b663a0670f99a3c07ded3f1c8e59c5658a
 #
-# Or unsecure form for the same password:
+# Or insecure form for the same password:
 #
 # cli-password=CHANGE_ME
 
@@ -696,7 +697,7 @@ no-cli
 #web-admin-port=8080
 
 # Web-admin server listen on STUN/TURN worker threads
-# By default it is disabled for security resons! (Not recommended in any production environment!)
+# By default it is disabled for security reasons! (Not recommended in any production environment!)
 #
 #web-admin-listen-on-workers
 
