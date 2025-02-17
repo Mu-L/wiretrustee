@@ -37,6 +37,17 @@ type ManagementServiceClient interface {
 	// EncryptedMessage of the request has a body of DeviceAuthorizationFlowRequest.
 	// EncryptedMessage of the response has a body of DeviceAuthorizationFlow.
 	GetDeviceAuthorizationFlow(ctx context.Context, in *EncryptedMessage, opts ...grpc.CallOption) (*EncryptedMessage, error)
+	// Exposes a PKCE authorization code flow information
+	// This is used for initiating a Oauth 2 authorization grant flow
+	// with Proof Key for Code Exchange (PKCE) which will be used by our clients to Login.
+	// EncryptedMessage of the request has a body of PKCEAuthorizationFlowRequest.
+	// EncryptedMessage of the response has a body of PKCEAuthorizationFlow.
+	GetPKCEAuthorizationFlow(ctx context.Context, in *EncryptedMessage, opts ...grpc.CallOption) (*EncryptedMessage, error)
+	// SyncMeta is used to sync metadata of the peer.
+	// After sync the peer if there is a change in peer posture check which  needs to be evaluated by the client,
+	// sync meta will evaluate the checks and update the peer meta with the result.
+	// EncryptedMessage of the request has a body of Empty.
+	SyncMeta(ctx context.Context, in *EncryptedMessage, opts ...grpc.CallOption) (*Empty, error)
 }
 
 type managementServiceClient struct {
@@ -115,6 +126,24 @@ func (c *managementServiceClient) GetDeviceAuthorizationFlow(ctx context.Context
 	return out, nil
 }
 
+func (c *managementServiceClient) GetPKCEAuthorizationFlow(ctx context.Context, in *EncryptedMessage, opts ...grpc.CallOption) (*EncryptedMessage, error) {
+	out := new(EncryptedMessage)
+	err := c.cc.Invoke(ctx, "/management.ManagementService/GetPKCEAuthorizationFlow", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *managementServiceClient) SyncMeta(ctx context.Context, in *EncryptedMessage, opts ...grpc.CallOption) (*Empty, error) {
+	out := new(Empty)
+	err := c.cc.Invoke(ctx, "/management.ManagementService/SyncMeta", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ManagementServiceServer is the server API for ManagementService service.
 // All implementations must embed UnimplementedManagementServiceServer
 // for forward compatibility
@@ -138,6 +167,17 @@ type ManagementServiceServer interface {
 	// EncryptedMessage of the request has a body of DeviceAuthorizationFlowRequest.
 	// EncryptedMessage of the response has a body of DeviceAuthorizationFlow.
 	GetDeviceAuthorizationFlow(context.Context, *EncryptedMessage) (*EncryptedMessage, error)
+	// Exposes a PKCE authorization code flow information
+	// This is used for initiating a Oauth 2 authorization grant flow
+	// with Proof Key for Code Exchange (PKCE) which will be used by our clients to Login.
+	// EncryptedMessage of the request has a body of PKCEAuthorizationFlowRequest.
+	// EncryptedMessage of the response has a body of PKCEAuthorizationFlow.
+	GetPKCEAuthorizationFlow(context.Context, *EncryptedMessage) (*EncryptedMessage, error)
+	// SyncMeta is used to sync metadata of the peer.
+	// After sync the peer if there is a change in peer posture check which  needs to be evaluated by the client,
+	// sync meta will evaluate the checks and update the peer meta with the result.
+	// EncryptedMessage of the request has a body of Empty.
+	SyncMeta(context.Context, *EncryptedMessage) (*Empty, error)
 	mustEmbedUnimplementedManagementServiceServer()
 }
 
@@ -159,6 +199,12 @@ func (UnimplementedManagementServiceServer) IsHealthy(context.Context, *Empty) (
 }
 func (UnimplementedManagementServiceServer) GetDeviceAuthorizationFlow(context.Context, *EncryptedMessage) (*EncryptedMessage, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetDeviceAuthorizationFlow not implemented")
+}
+func (UnimplementedManagementServiceServer) GetPKCEAuthorizationFlow(context.Context, *EncryptedMessage) (*EncryptedMessage, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPKCEAuthorizationFlow not implemented")
+}
+func (UnimplementedManagementServiceServer) SyncMeta(context.Context, *EncryptedMessage) (*Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SyncMeta not implemented")
 }
 func (UnimplementedManagementServiceServer) mustEmbedUnimplementedManagementServiceServer() {}
 
@@ -266,6 +312,42 @@ func _ManagementService_GetDeviceAuthorizationFlow_Handler(srv interface{}, ctx 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ManagementService_GetPKCEAuthorizationFlow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EncryptedMessage)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ManagementServiceServer).GetPKCEAuthorizationFlow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/management.ManagementService/GetPKCEAuthorizationFlow",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ManagementServiceServer).GetPKCEAuthorizationFlow(ctx, req.(*EncryptedMessage))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ManagementService_SyncMeta_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EncryptedMessage)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ManagementServiceServer).SyncMeta(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/management.ManagementService/SyncMeta",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ManagementServiceServer).SyncMeta(ctx, req.(*EncryptedMessage))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ManagementService_ServiceDesc is the grpc.ServiceDesc for ManagementService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -288,6 +370,14 @@ var ManagementService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetDeviceAuthorizationFlow",
 			Handler:    _ManagementService_GetDeviceAuthorizationFlow_Handler,
+		},
+		{
+			MethodName: "GetPKCEAuthorizationFlow",
+			Handler:    _ManagementService_GetPKCEAuthorizationFlow_Handler,
+		},
+		{
+			MethodName: "SyncMeta",
+			Handler:    _ManagementService_SyncMeta_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -2,8 +2,9 @@ package cmd
 
 import (
 	"context"
-	"github.com/netbirdio/netbird/util"
 	"time"
+
+	"github.com/netbirdio/netbird/util"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -15,7 +16,7 @@ var downCmd = &cobra.Command{
 	Use:   "down",
 	Short: "down netbird connections",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		SetFlagsFromEnvVars()
+		SetFlagsFromEnvVars(rootCmd)
 
 		cmd.SetOut(cmd.OutOrStdout())
 
@@ -25,7 +26,7 @@ var downCmd = &cobra.Command{
 			return err
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*7)
 		defer cancel()
 
 		conn, err := DialClientGRPCServer(ctx, daemonAddr)
@@ -41,6 +42,8 @@ var downCmd = &cobra.Command{
 			log.Errorf("call service down method: %v", err)
 			return err
 		}
+
+		cmd.Println("Disconnected")
 		return nil
 	},
 }

@@ -2,33 +2,35 @@ package server_test
 
 import (
 	"context"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
-	"path/filepath"
 	"runtime"
 	sync2 "sync"
 	"time"
 
-	server "github.com/netbirdio/netbird/management/server"
-	"google.golang.org/grpc/credentials/insecure"
-
 	pb "github.com/golang/protobuf/proto" //nolint
-	"github.com/netbirdio/netbird/encryption"
-	log "github.com/sirupsen/logrus"
-
-	mgmtProto "github.com/netbirdio/netbird/management/proto"
-	"github.com/netbirdio/netbird/util"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	log "github.com/sirupsen/logrus"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+
+	"github.com/netbirdio/netbird/encryption"
+	mgmtProto "github.com/netbirdio/netbird/management/proto"
+	"github.com/netbirdio/netbird/management/server"
+	"github.com/netbirdio/netbird/management/server/activity"
+	"github.com/netbirdio/netbird/management/server/settings"
+	"github.com/netbirdio/netbird/management/server/store"
+	"github.com/netbirdio/netbird/management/server/telemetry"
+	"github.com/netbirdio/netbird/util"
 )
 
 const (
 	ValidSetupKey = "A2C8E62B-38F5-4553-B31E-DD66C696CEBB"
+	AccountKey    = "bf1c8084-ba50-4ce7-9439-34653001fc3b"
 )
 
 var _ = Describe("Management service", func() {
@@ -45,11 +47,9 @@ var _ = Describe("Management service", func() {
 		level, _ := log.ParseLevel("Debug")
 		log.SetLevel(level)
 		var err error
-		dataDir, err = ioutil.TempDir("", "wiretrustee_mgmt_test_tmp_*")
+		dataDir, err = os.MkdirTemp("", "netbird_mgmt_test_tmp_*")
 		Expect(err).NotTo(HaveOccurred())
 
-		err = util.CopyFileContents("testdata/store.json", filepath.Join(dataDir, "store.json"))
-		Expect(err).NotTo(HaveOccurred())
 		var listener net.Listener
 
 		config := &server.Config{}
@@ -57,7 +57,7 @@ var _ = Describe("Management service", func() {
 		Expect(err).NotTo(HaveOccurred())
 		config.Datadir = dataDir
 
-		s, listener = startServer(config)
+		s, listener = startServer(config, dataDir, "testdata/store.sql")
 		addr = listener.Addr().String()
 		client, conn = createRawClient(addr)
 
@@ -90,7 +90,8 @@ var _ = Describe("Management service", func() {
 				key, _ := wgtypes.GenerateKey()
 				loginPeerWithValidSetupKey(serverPubKey, key, client)
 
-				encryptedBytes, err := encryption.EncryptMessage(serverPubKey, key, &mgmtProto.SyncRequest{})
+				syncReq := &mgmtProto.SyncRequest{Meta: &mgmtProto.PeerSystemMeta{}}
+				encryptedBytes, err := encryption.EncryptMessage(serverPubKey, key, syncReq)
 				Expect(err).NotTo(HaveOccurred())
 
 				sync, err := client.Sync(context.TODO(), &mgmtProto.EncryptedMessage{
@@ -107,28 +108,27 @@ var _ = Describe("Management service", func() {
 				err = encryption.DecryptMessage(serverPubKey, key, encryptedResponse.Body, resp)
 				Expect(err).NotTo(HaveOccurred())
 
-				Expect(resp.PeerConfig.Address).To(BeEquivalentTo("100.64.0.1/24"))
-
 				expectedSignalConfig := &mgmtProto.HostConfig{
-					Uri:      "signal.wiretrustee.com:10000",
+					Uri:      "signal.netbird.io:10000",
 					Protocol: mgmtProto.HostConfig_HTTP,
 				}
 				expectedStunsConfig := &mgmtProto.HostConfig{
-					Uri:      "stun:stun.wiretrustee.com:3468",
+					Uri:      "stun:stun.netbird.io:3468",
 					Protocol: mgmtProto.HostConfig_UDP,
 				}
 				expectedTRUNHost := &mgmtProto.HostConfig{
-					Uri:      "turn:stun.wiretrustee.com:3468",
+					Uri:      "turn:stun.netbird.io:3468",
 					Protocol: mgmtProto.HostConfig_UDP,
 				}
 
-				Expect(resp.WiretrusteeConfig.Signal).To(BeEquivalentTo(expectedSignalConfig))
-				Expect(resp.WiretrusteeConfig.Stuns).To(ConsistOf(expectedStunsConfig))
+				Expect(resp.NetbirdConfig.Signal).To(BeEquivalentTo(expectedSignalConfig))
+				Expect(resp.NetbirdConfig.Stuns).To(ConsistOf(expectedStunsConfig))
 				// TURN validation is special because credentials are dynamically generated
-				Expect(resp.WiretrusteeConfig.Turns).To(HaveLen(1))
-				actualTURN := resp.WiretrusteeConfig.Turns[0]
+				Expect(resp.NetbirdConfig.Turns).To(HaveLen(1))
+				actualTURN := resp.NetbirdConfig.Turns[0]
 				Expect(len(actualTURN.User) > 0).To(BeTrue())
 				Expect(actualTURN.HostConfig).To(BeEquivalentTo(expectedTRUNHost))
+				Expect(len(resp.NetworkMap.OfflinePeers) == 0).To(BeTrue())
 			})
 		})
 
@@ -141,7 +141,7 @@ var _ = Describe("Management service", func() {
 				loginPeerWithValidSetupKey(serverPubKey, key1, client)
 				loginPeerWithValidSetupKey(serverPubKey, key2, client)
 
-				messageBytes, err := pb.Marshal(&mgmtProto.SyncRequest{})
+				messageBytes, err := pb.Marshal(&mgmtProto.SyncRequest{Meta: &mgmtProto.PeerSystemMeta{}})
 				Expect(err).NotTo(HaveOccurred())
 				encryptedBytes, err := encryption.Encrypt(messageBytes, serverPubKey, key)
 				Expect(err).NotTo(HaveOccurred())
@@ -174,7 +174,7 @@ var _ = Describe("Management service", func() {
 				key, _ := wgtypes.GenerateKey()
 				loginPeerWithValidSetupKey(serverPubKey, key, client)
 
-				messageBytes, err := pb.Marshal(&mgmtProto.SyncRequest{})
+				messageBytes, err := pb.Marshal(&mgmtProto.SyncRequest{Meta: &mgmtProto.PeerSystemMeta{}})
 				Expect(err).NotTo(HaveOccurred())
 				encryptedBytes, err := encryption.Encrypt(messageBytes, serverPubKey, key)
 				Expect(err).NotTo(HaveOccurred())
@@ -242,7 +242,8 @@ var _ = Describe("Management service", func() {
 		Context("with an invalid setup key", func() {
 			Specify("an error is returned", func() {
 				key, _ := wgtypes.GenerateKey()
-				message, err := encryption.EncryptMessage(serverPubKey, key, &mgmtProto.LoginRequest{SetupKey: "invalid setup key"})
+				message, err := encryption.EncryptMessage(serverPubKey, key, &mgmtProto.LoginRequest{SetupKey: "invalid setup key",
+					Meta: &mgmtProto.PeerSystemMeta{}})
 				Expect(err).NotTo(HaveOccurred())
 
 				resp, err := client.Login(context.TODO(), &mgmtProto.EncryptedMessage{
@@ -271,7 +272,7 @@ var _ = Describe("Management service", func() {
 				Expect(regResp).NotTo(BeNil())
 
 				// just login without registration
-				message, err := encryption.EncryptMessage(serverPubKey, key, &mgmtProto.LoginRequest{})
+				message, err := encryption.EncryptMessage(serverPubKey, key, &mgmtProto.LoginRequest{Meta: &mgmtProto.PeerSystemMeta{}})
 				Expect(err).NotTo(HaveOccurred())
 				loginResp, err := client.Login(context.TODO(), &mgmtProto.EncryptedMessage{
 					WgPubKey: key.PublicKey().String(),
@@ -285,33 +286,33 @@ var _ = Describe("Management service", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				expectedSignalConfig := &mgmtProto.HostConfig{
-					Uri:      "signal.wiretrustee.com:10000",
+					Uri:      "signal.netbird.io:10000",
 					Protocol: mgmtProto.HostConfig_HTTP,
 				}
 				expectedStunsConfig := &mgmtProto.HostConfig{
-					Uri:      "stun:stun.wiretrustee.com:3468",
+					Uri:      "stun:stun.netbird.io:3468",
 					Protocol: mgmtProto.HostConfig_UDP,
 				}
 				expectedTurnsConfig := &mgmtProto.ProtectedHostConfig{
 					HostConfig: &mgmtProto.HostConfig{
-						Uri:      "turn:stun.wiretrustee.com:3468",
+						Uri:      "turn:stun.netbird.io:3468",
 						Protocol: mgmtProto.HostConfig_UDP,
 					},
 					User:     "some_user",
 					Password: "some_password",
 				}
 
-				Expect(decryptedResp.GetWiretrusteeConfig().Signal).To(BeEquivalentTo(expectedSignalConfig))
-				Expect(decryptedResp.GetWiretrusteeConfig().Stuns).To(ConsistOf(expectedStunsConfig))
-				Expect(decryptedResp.GetWiretrusteeConfig().Turns).To(ConsistOf(expectedTurnsConfig))
+				Expect(decryptedResp.GetNetbirdConfig().Signal).To(BeEquivalentTo(expectedSignalConfig))
+				Expect(decryptedResp.GetNetbirdConfig().Stuns).To(ConsistOf(expectedStunsConfig))
+				Expect(decryptedResp.GetNetbirdConfig().Turns).To(ConsistOf(expectedTurnsConfig))
 			})
 		})
 	})
 
-	Context("when there are 50 peers registered under one account", func() {
+	Context("when there are 10 peers registered under one account", func() {
 		Context("when there are 10 more peers registered under the same account", func() {
-			Specify("all of the 50 peers will get updates of 10 newly registered peers", func() {
-				initialPeers := 20
+			Specify("all of the 10 peers will get updates of 10 newly registered peers", func() {
+				initialPeers := 10
 				additionalPeers := 10
 
 				var peers []wgtypes.Key
@@ -326,7 +327,7 @@ var _ = Describe("Management service", func() {
 
 				var clients []mgmtProto.ManagementService_SyncClient
 				for _, peer := range peers {
-					messageBytes, err := pb.Marshal(&mgmtProto.SyncRequest{})
+					messageBytes, err := pb.Marshal(&mgmtProto.SyncRequest{Meta: &mgmtProto.PeerSystemMeta{}})
 					Expect(err).NotTo(HaveOccurred())
 					encryptedBytes, err := encryption.Encrypt(messageBytes, serverPubKey, peer)
 					Expect(err).NotTo(HaveOccurred())
@@ -366,8 +367,8 @@ var _ = Describe("Management service", func() {
 				for i := 0; i < additionalPeers; i++ {
 					key, _ := wgtypes.GenerateKey()
 					loginPeerWithValidSetupKey(serverPubKey, key, client)
-					rand.Seed(time.Now().UnixNano())
-					n := rand.Intn(500)
+					r := rand.New(rand.NewSource(time.Now().UnixNano()))
+					n := r.Intn(200)
 					time.Sleep(time.Duration(n) * time.Millisecond)
 				}
 
@@ -388,9 +389,11 @@ var _ = Describe("Management service", func() {
 			ipChannel := make(chan string, 20)
 			for i := 0; i < initialPeers; i++ {
 				go func() {
+					defer GinkgoRecover()
 					key, _ := wgtypes.GenerateKey()
 					loginPeerWithValidSetupKey(serverPubKey, key, client)
-					encryptedBytes, err := encryption.EncryptMessage(serverPubKey, key, &mgmtProto.SyncRequest{})
+					syncReq := &mgmtProto.SyncRequest{Meta: &mgmtProto.PeerSystemMeta{}}
+					encryptedBytes, err := encryption.EncryptMessage(serverPubKey, key, syncReq)
 					Expect(err).NotTo(HaveOccurred())
 
 					// open stream
@@ -424,19 +427,35 @@ var _ = Describe("Management service", func() {
 			close(ipChannel)
 		})
 	})
+
+	Context("after login two peers", func() {
+		Specify("then they receive the same network", func() {
+			key, _ := wgtypes.GenerateKey()
+			firstLogin := loginPeerWithValidSetupKey(serverPubKey, key, client)
+			key, _ = wgtypes.GenerateKey()
+			secondLogin := loginPeerWithValidSetupKey(serverPubKey, key, client)
+
+			_, firstLoginNetwork, err := net.ParseCIDR(firstLogin.GetPeerConfig().GetAddress())
+			Expect(err).NotTo(HaveOccurred())
+			_, secondLoginNetwork, err := net.ParseCIDR(secondLogin.GetPeerConfig().GetAddress())
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(secondLoginNetwork.String()).To(BeEquivalentTo(firstLoginNetwork.String()))
+		})
+	})
 })
 
 func loginPeerWithValidSetupKey(serverPubKey wgtypes.Key, key wgtypes.Key, client mgmtProto.ManagementServiceClient) *mgmtProto.LoginResponse {
 	defer GinkgoRecover()
 
 	meta := &mgmtProto.PeerSystemMeta{
-		Hostname:           key.PublicKey().String(),
-		GoOS:               runtime.GOOS,
-		OS:                 runtime.GOOS,
-		Core:               "core",
-		Platform:           "platform",
-		Kernel:             "kernel",
-		WiretrusteeVersion: "",
+		Hostname:       key.PublicKey().String(),
+		GoOS:           runtime.GOOS,
+		OS:             runtime.GOOS,
+		Core:           "core",
+		Platform:       "platform",
+		Kernel:         "kernel",
+		NetbirdVersion: "",
 	}
 	message, err := encryption.EncryptMessage(serverPubKey, key, &mgmtProto.LoginRequest{SetupKey: ValidSetupKey, Meta: meta})
 	Expect(err).NotTo(HaveOccurred())
@@ -470,22 +489,31 @@ func createRawClient(addr string) (mgmtProto.ManagementServiceClient, *grpc.Clie
 	return mgmtProto.NewManagementServiceClient(conn), conn
 }
 
-func startServer(config *server.Config) (*grpc.Server, net.Listener) {
+func startServer(config *server.Config, dataDir string, testFile string) (*grpc.Server, net.Listener) {
 	lis, err := net.Listen("tcp", ":0")
 	Expect(err).NotTo(HaveOccurred())
 	s := grpc.NewServer()
 
-	store, err := server.NewStore(config.Datadir)
+	store, _, err := store.NewTestStoreFromSQL(context.Background(), testFile, dataDir)
 	if err != nil {
 		log.Fatalf("failed creating a store: %s: %v", config.Datadir, err)
 	}
-	peersUpdateManager := server.NewPeersUpdateManager()
-	accountManager, err := server.BuildManager(store, peersUpdateManager, nil)
+
+	peersUpdateManager := server.NewPeersUpdateManager(nil)
+	eventStore := &activity.InMemoryEventStore{}
+
+	metrics, err := telemetry.NewDefaultAppMetrics(context.Background())
+	if err != nil {
+		log.Fatalf("failed creating metrics: %v", err)
+	}
+
+	accountManager, err := server.BuildManager(context.Background(), store, peersUpdateManager, nil, "", "netbird.selfhosted", eventStore, nil, false, server.MocIntegratedValidator{}, metrics)
 	if err != nil {
 		log.Fatalf("failed creating a manager: %v", err)
 	}
-	turnManager := server.NewTimeBasedAuthSecretsManager(peersUpdateManager, config.TURNConfig)
-	mgmtServer, err := server.NewServer(config, accountManager, peersUpdateManager, turnManager)
+
+	secretsManager := server.NewTimeBasedAuthSecretsManager(peersUpdateManager, config.TURNConfig, config.Relay)
+	mgmtServer, err := server.NewServer(context.Background(), config, accountManager, settings.NewManager(store), peersUpdateManager, secretsManager, nil, nil)
 	Expect(err).NotTo(HaveOccurred())
 	mgmtProto.RegisterManagementServiceServer(s, mgmtServer)
 	go func() {

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"os/signal"
 	"path"
@@ -25,6 +24,23 @@ import (
 	"github.com/netbirdio/netbird/client/internal"
 )
 
+const (
+	externalIPMapFlag       = "external-ip-map"
+	dnsResolverAddress      = "dns-resolver-address"
+	enableRosenpassFlag     = "enable-rosenpass"
+	rosenpassPermissiveFlag = "rosenpass-permissive"
+	preSharedKeyFlag        = "preshared-key"
+	interfaceNameFlag       = "interface-name"
+	wireguardPortFlag       = "wireguard-port"
+	networkMonitorFlag      = "network-monitor"
+	disableAutoConnectFlag  = "disable-auto-connect"
+	serverSSHAllowedFlag    = "allow-server-ssh"
+	extraIFaceBlackListFlag = "extra-iface-blacklist"
+	dnsRouteIntervalFlag    = "dns-router-interval"
+	systemInfoFlag          = "system-info"
+	blockLANAccessFlag      = "block-lan-access"
+)
+
 var (
 	configPath              string
 	defaultConfigPathDir    string
@@ -41,8 +57,26 @@ var (
 	managementURL           string
 	adminURL                string
 	setupKey                string
+	setupKeyPath            string
+	hostName                string
 	preSharedKey            string
-	rootCmd                 = &cobra.Command{
+	natExternalIPs          []string
+	customDNSAddress        string
+	rosenpassEnabled        bool
+	rosenpassPermissive     bool
+	serverSSHAllowed        bool
+	interfaceName           string
+	wireguardPort           uint16
+	networkMonitor          bool
+	serviceName             string
+	autoConnectDisabled     bool
+	extraIFaceBlackList     []string
+	anonymizeFlag           bool
+	debugSystemInfoFlag     bool
+	dnsRouteInterval        time.Duration
+	blockLANAccess          bool
+
+	rootCmd = &cobra.Command{
 		Use:          "netbird",
 		Short:        "",
 		Long:         "",
@@ -62,12 +96,15 @@ func init() {
 	oldDefaultConfigPathDir = "/etc/wiretrustee/"
 	oldDefaultLogFileDir = "/var/log/wiretrustee/"
 
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows":
 		defaultConfigPathDir = os.Getenv("PROGRAMDATA") + "\\Netbird\\"
 		defaultLogFileDir = os.Getenv("PROGRAMDATA") + "\\Netbird\\"
 
 		oldDefaultConfigPathDir = os.Getenv("PROGRAMDATA") + "\\Wiretrustee\\"
 		oldDefaultLogFileDir = os.Getenv("PROGRAMDATA") + "\\Wiretrustee\\"
+	case "freebsd":
+		defaultConfigPathDir = "/var/db/netbird/"
 	}
 
 	defaultConfigPath = defaultConfigPathDir + "config.json"
@@ -80,22 +117,67 @@ func init() {
 	if runtime.GOOS == "windows" {
 		defaultDaemonAddr = "tcp://127.0.0.1:41731"
 	}
+
+	defaultServiceName := "netbird"
+	if runtime.GOOS == "windows" {
+		defaultServiceName = "Netbird"
+	}
+
 	rootCmd.PersistentFlags().StringVar(&daemonAddr, "daemon-addr", defaultDaemonAddr, "Daemon service address to serve CLI requests [unix|tcp]://[path|host:port]")
-	rootCmd.PersistentFlags().StringVar(&managementURL, "management-url", "", fmt.Sprintf("Management Service URL [http|https]://[host]:[port] (default \"%s\")", internal.ManagementURLDefault().String()))
-	rootCmd.PersistentFlags().StringVar(&adminURL, "admin-url", "https://app.netbird.io", "Admin Panel URL [http|https]://[host]:[port]")
-	rootCmd.PersistentFlags().StringVar(&configPath, "config", defaultConfigPath, "Netbird config file location")
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "sets Netbird log level")
-	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", defaultLogFile, "sets Netbird log path. If console is specified the the log will be output to stdout")
-	rootCmd.PersistentFlags().StringVar(&setupKey, "setup-key", "", "Setup key obtained from the Management Service Dashboard (used to register peer)")
-	rootCmd.PersistentFlags().StringVar(&preSharedKey, "preshared-key", "", "Sets Wireguard PreSharedKey property. If set, then only peers that have the same key can communicate.")
+	rootCmd.PersistentFlags().StringVarP(&managementURL, "management-url", "m", "", fmt.Sprintf("Management Service URL [http|https]://[host]:[port] (default \"%s\")", internal.DefaultManagementURL))
+	rootCmd.PersistentFlags().StringVar(&adminURL, "admin-url", "", fmt.Sprintf("Admin Panel URL [http|https]://[host]:[port] (default \"%s\")", internal.DefaultAdminURL))
+	rootCmd.PersistentFlags().StringVarP(&serviceName, "service", "s", defaultServiceName, "Netbird system service name")
+	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", defaultConfigPath, "Netbird config file location")
+	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "info", "sets Netbird log level")
+	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", defaultLogFile, "sets Netbird log path. If console is specified the log will be output to stdout. If syslog is specified the log will be sent to syslog daemon.")
+	rootCmd.PersistentFlags().StringVarP(&setupKey, "setup-key", "k", "", "Setup key obtained from the Management Service Dashboard (used to register peer)")
+	rootCmd.PersistentFlags().StringVar(&setupKeyPath, "setup-key-file", "", "The path to a setup key obtained from the Management Service Dashboard (used to register peer) This is ignored if the setup-key flag is provided.")
+	rootCmd.MarkFlagsMutuallyExclusive("setup-key", "setup-key-file")
+	rootCmd.PersistentFlags().StringVar(&preSharedKey, preSharedKeyFlag, "", "Sets Wireguard PreSharedKey property. If set, then only peers that have the same key can communicate.")
+	rootCmd.PersistentFlags().StringVarP(&hostName, "hostname", "n", "", "Sets a custom hostname for the device")
+	rootCmd.PersistentFlags().BoolVarP(&anonymizeFlag, "anonymize", "A", false, "anonymize IP addresses and non-netbird.io domains in logs and status output")
+
 	rootCmd.AddCommand(serviceCmd)
 	rootCmd.AddCommand(upCmd)
 	rootCmd.AddCommand(downCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(loginCmd)
 	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(sshCmd)
+	rootCmd.AddCommand(networksCMD)
+	rootCmd.AddCommand(debugCmd)
+
 	serviceCmd.AddCommand(runCmd, startCmd, stopCmd, restartCmd) // service control commands are subcommands of service
 	serviceCmd.AddCommand(installCmd, uninstallCmd)              // service installer commands are subcommands of service
+
+	networksCMD.AddCommand(routesListCmd)
+	networksCMD.AddCommand(routesSelectCmd, routesDeselectCmd)
+
+	debugCmd.AddCommand(debugBundleCmd)
+	debugCmd.AddCommand(logCmd)
+	logCmd.AddCommand(logLevelCmd)
+	debugCmd.AddCommand(forCmd)
+	debugCmd.AddCommand(persistenceCmd)
+
+	upCmd.PersistentFlags().StringSliceVar(&natExternalIPs, externalIPMapFlag, nil,
+		`Sets external IPs maps between local addresses and interfaces.`+
+			`You can specify a comma-separated list with a single IP and IP/IP or IP/Interface Name. `+
+			`An empty string "" clears the previous configuration. `+
+			`E.g. --external-ip-map 12.34.56.78/10.0.0.1 or --external-ip-map 12.34.56.200,12.34.56.78/10.0.0.1,12.34.56.80/eth1 `+
+			`or --external-ip-map ""`,
+	)
+	upCmd.PersistentFlags().StringVar(&customDNSAddress, dnsResolverAddress, "",
+		`Sets a custom address for NetBird's local DNS resolver. `+
+			`If set, the agent won't attempt to discover the best ip and port to listen on. `+
+			`An empty string "" clears the previous configuration. `+
+			`E.g. --dns-resolver-address 127.0.0.1:5053 or --dns-resolver-address ""`,
+	)
+	upCmd.PersistentFlags().BoolVar(&rosenpassEnabled, enableRosenpassFlag, false, "[Experimental] Enable Rosenpass feature. If enabled, the connection will be post-quantum secured via Rosenpass.")
+	upCmd.PersistentFlags().BoolVar(&rosenpassPermissive, rosenpassPermissiveFlag, false, "[Experimental] Enable Rosenpass in permissive mode to allow this peer to accept WireGuard connections without requiring Rosenpass functionality from peers that do not have Rosenpass enabled.")
+	upCmd.PersistentFlags().BoolVar(&serverSSHAllowed, serverSSHAllowedFlag, false, "Allow SSH server on peer. If enabled, the SSH server will be permitted")
+	upCmd.PersistentFlags().BoolVar(&autoConnectDisabled, disableAutoConnectFlag, false, "Disables auto-connect feature. If enabled, then the client won't connect automatically when the service starts.")
+
+	debugCmd.PersistentFlags().BoolVarP(&debugSystemInfoFlag, systemInfoFlag, "S", false, "Adds system information to the debug bundle")
 }
 
 // SetupCloseHandler handles SIGTERM signal and exits with success
@@ -115,8 +197,8 @@ func SetupCloseHandler(ctx context.Context, cancel context.CancelFunc) {
 }
 
 // SetFlagsFromEnvVars reads and updates flag values from environment variables with prefix WT_
-func SetFlagsFromEnvVars() {
-	flags := rootCmd.PersistentFlags()
+func SetFlagsFromEnvVars(cmd *cobra.Command) {
+	flags := cmd.PersistentFlags()
 	flags.VisitAll(func(f *pflag.Flag) {
 		oldEnvVar := FlagNameToEnvVar(f.Name, "WT_")
 
@@ -146,7 +228,7 @@ func FlagNameToEnvVar(cmdFlag string, prefix string) string {
 	return prefix + upper
 }
 
-// DialClientGRPCServer returns client connection to the dameno server.
+// DialClientGRPCServer returns client connection to the daemon server.
 func DialClientGRPCServer(ctx context.Context, addr string) (*grpc.ClientConn, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
 	defer cancel()
@@ -175,6 +257,21 @@ var CLIBackOffSettings = &backoff.ExponentialBackOff{
 	MaxElapsedTime:      30 * time.Second,
 	Stop:                backoff.Stop,
 	Clock:               backoff.SystemClock,
+}
+
+func getSetupKey() (string, error) {
+	if setupKeyPath != "" && setupKey == "" {
+		return getSetupKeyFromFile(setupKeyPath)
+	}
+	return setupKey, nil
+}
+
+func getSetupKeyFromFile(setupKeyPath string) (string, error) {
+	data, err := os.ReadFile(setupKeyPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read setup key file: %v", err)
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 func handleRebrand(cmd *cobra.Command) error {
@@ -235,7 +332,7 @@ func copySymLink(source, dest string) error {
 
 func cpDir(src string, dst string) error {
 	var err error
-	var fds []os.FileInfo
+	var fds []os.DirEntry
 	var srcinfo os.FileInfo
 
 	if srcinfo, err = os.Stat(src); err != nil {
@@ -246,7 +343,7 @@ func cpDir(src string, dst string) error {
 		return err
 	}
 
-	if fds, err = ioutil.ReadDir(src); err != nil {
+	if fds, err = os.ReadDir(src); err != nil {
 		return err
 	}
 	for _, fd := range fds {
@@ -285,4 +382,18 @@ func migrateToNetbird(oldPath, newPath string) bool {
 	}
 
 	return true
+}
+
+func getClient(cmd *cobra.Command) (*grpc.ClientConn, error) {
+	SetFlagsFromEnvVars(rootCmd)
+	cmd.SetOut(cmd.OutOrStdout())
+
+	conn, err := DialClientGRPCServer(cmd.Context(), daemonAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to daemon error: %v\n"+
+			"If the daemon is not running please run: "+
+			"\nnetbird service install \nnetbird service start\n", err)
+	}
+
+	return conn, nil
 }

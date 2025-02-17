@@ -1,44 +1,98 @@
+//go:build !ios
+// +build !ios
+
 package system
 
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/version"
 )
 
 // GetInfo retrieves and parses the system information
 func GetInfo(ctx context.Context) *Info {
-	out := _getInfo()
-	for strings.Contains(out, "broken pipe") {
-		out = _getInfo()
-		time.Sleep(500 * time.Millisecond)
+	utsname := unix.Utsname{}
+	err := unix.Uname(&utsname)
+	if err != nil {
+		log.Warnf("getInfo: %s", err)
 	}
-	osStr := strings.Replace(out, "\n", "", -1)
-	osStr = strings.Replace(osStr, "\r\n", "", -1)
-	osInfo := strings.Split(osStr, " ")
-	gio := &Info{Kernel: osInfo[0], OSVersion: osInfo[1], Core: osInfo[1], Platform: osInfo[2], OS: osInfo[0], GoOS: runtime.GOOS, CPUs: runtime.NumCPU()}
-	gio.Hostname, _ = os.Hostname()
-	gio.WiretrusteeVersion = NetbirdVersion()
+	sysName := string(bytes.Split(utsname.Sysname[:], []byte{0})[0])
+	machine := string(bytes.Split(utsname.Machine[:], []byte{0})[0])
+	release := string(bytes.Split(utsname.Release[:], []byte{0})[0])
+	swVersion, err := exec.Command("sw_vers", "-productVersion").Output()
+	if err != nil {
+		log.Warnf("got an error while retrieving macOS version with sw_vers, error: %s. Using darwin version instead.\n", err)
+		swVersion = []byte(release)
+	}
+
+	addrs, err := networkAddresses()
+	if err != nil {
+		log.Warnf("failed to discover network addresses: %s", err)
+	}
+
+	start := time.Now()
+	si := updateStaticInfo()
+	if time.Since(start) > 1*time.Second {
+		log.Warnf("updateStaticInfo took %s", time.Since(start))
+	}
+
+	gio := &Info{
+		Kernel:             sysName,
+		OSVersion:          strings.TrimSpace(string(swVersion)),
+		Platform:           machine,
+		OS:                 sysName,
+		GoOS:               runtime.GOOS,
+		CPUs:               runtime.NumCPU(),
+		KernelVersion:      release,
+		NetworkAddresses:   addrs,
+		SystemSerialNumber: si.SystemSerialNumber,
+		SystemProductName:  si.SystemProductName,
+		SystemManufacturer: si.SystemManufacturer,
+		Environment:        si.Environment,
+	}
+
+	systemHostname, _ := os.Hostname()
+	gio.Hostname = extractDeviceName(ctx, systemHostname)
+	gio.NetbirdVersion = version.NetbirdVersion()
 	gio.UIVersion = extractUserAgent(ctx)
 
 	return gio
 }
 
-func _getInfo() string {
-	cmd := exec.Command("uname", "-srm")
-	cmd.Stdin = strings.NewReader("some input")
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if err != nil {
-		fmt.Println("getInfo:", err)
+func sysInfo() (serialNumber string, productName string, manufacturer string) {
+	out, _ := exec.Command("/usr/sbin/ioreg", "-l").Output() // err ignored for brevity
+	for _, l := range strings.Split(string(out), "\n") {
+		if strings.Contains(l, "IOPlatformSerialNumber") {
+			serialNumber = trimIoRegLine(l)
+		}
+
+		if strings.Contains(l, "ModelNumber") && productName == "" {
+			productName = trimIoRegLine(l)
+		}
+
+		if strings.Contains(l, "device manufacturer") && manufacturer == "" {
+			manufacturer = trimIoRegLine(l)
+		}
+
 	}
-	return out.String()
+	return
+}
+
+func trimIoRegLine(l string) string {
+	kv := strings.Split(l, "=")
+	if len(kv) != 2 {
+		return ""
+	}
+	s := strings.TrimSpace(kv[1])
+	return strings.Trim(s, `"`)
 }
