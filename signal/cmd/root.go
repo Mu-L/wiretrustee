@@ -7,6 +7,8 @@ import (
 	"runtime"
 
 	"github.com/spf13/cobra"
+
+	"github.com/netbirdio/netbird/version"
 )
 
 const (
@@ -20,9 +22,10 @@ var (
 	logFile        string
 
 	rootCmd = &cobra.Command{
-		Use:   "netbird-signal",
-		Short: "",
-		Long:  "",
+		Use:     "netbird-signal",
+		Short:   "",
+		Long:    "",
+		Version: version.NetbirdVersion(),
 	}
 
 	// Execution control channel for stopCh signal
@@ -44,7 +47,7 @@ func init() {
 	}
 
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "")
-	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", defaultLogFile, "sets Netbird log path. If console is specified the the log will be output to stdout")
+	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", defaultLogFile, "sets Netbird log path. If console is specified the log will be output to stdout")
 	rootCmd.AddCommand(runCmd)
 }
 

@@ -1,46 +1,73 @@
 package middleware
 
 import (
-	"fmt"
+	"context"
 	"net/http"
+	"regexp"
 
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
+	log "github.com/sirupsen/logrus"
+
+	nbcontext "github.com/netbirdio/netbird/management/server/context"
+	"github.com/netbirdio/netbird/management/server/http/middleware/bypass"
+	"github.com/netbirdio/netbird/management/server/http/util"
+	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/management/server/types"
 )
 
-type IsUserAdminFunc func(claims jwtclaims.AuthorizationClaims) (bool, error)
+// GetUser function defines a function to fetch user from Account by jwtclaims.AuthorizationClaims
+type GetUser func(ctx context.Context, userAuth nbcontext.UserAuth) (*types.User, error)
 
-// AccessControll middleware to restrict to make POST/PUT/DELETE requests by admin only
-type AccessControll struct {
-	jwtExtractor jwtclaims.ClaimsExtractor
-	isUserAdmin  IsUserAdminFunc
-	audience     string
+// AccessControl middleware to restrict to make POST/PUT/DELETE requests by admin only
+type AccessControl struct {
+	getUser GetUser
 }
 
-// NewAccessControll instance constructor
-func NewAccessControll(audience string, isUserAdmin IsUserAdminFunc) *AccessControll {
-	return &AccessControll{
-		isUserAdmin:  isUserAdmin,
-		audience:     audience,
-		jwtExtractor: *jwtclaims.NewClaimsExtractor(nil),
+// NewAccessControl instance constructor
+func NewAccessControl(getUser GetUser) *AccessControl {
+	return &AccessControl{
+		getUser: getUser,
 	}
 }
 
-// Handler method of the middleware which forbinneds all modify requests for non admin users
-func (a *AccessControll) Handler(h http.Handler) http.Handler {
+var tokenPathRegexp = regexp.MustCompile(`^.*/api/users/.*/tokens.*$`)
+
+// Handler method of the middleware which forbids all modify requests for non admin users
+func (a *AccessControl) Handler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		jwtClaims := a.jwtExtractor.ExtractClaimsFromRequestContext(r, a.audience)
 
-		ok, err := a.isUserAdmin(jwtClaims)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("error get user from JWT: %v", err), http.StatusUnauthorized)
+		if bypass.ShouldBypass(r.URL.Path, h, w, r) {
 			return
-
 		}
 
-		if !ok {
+		userAuth, err := nbcontext.GetUserAuthFromRequest(r)
+		if err != nil {
+			log.WithContext(r.Context()).Errorf("failed to get user auth from request: %s", err)
+			util.WriteError(r.Context(), status.Errorf(status.Unauthorized, "invalid user auth"), w)
+		}
+
+		user, err := a.getUser(r.Context(), userAuth)
+		if err != nil {
+			log.WithContext(r.Context()).Errorf("failed to get user: %s", err)
+			util.WriteError(r.Context(), status.Errorf(status.Unauthorized, "invalid user auth"), w)
+			return
+		}
+
+		if user.IsBlocked() {
+			util.WriteError(r.Context(), status.Errorf(status.PermissionDenied, "the user has no access to the API or is blocked"), w)
+			return
+		}
+
+		if !user.HasAdminPower() {
 			switch r.Method {
 			case http.MethodDelete, http.MethodPost, http.MethodPatch, http.MethodPut:
-				http.Error(w, "user is not admin", http.StatusForbidden)
+
+				if tokenPathRegexp.MatchString(r.URL.Path) {
+					log.WithContext(r.Context()).Debugf("valid Path")
+					h.ServeHTTP(w, r)
+					return
+				}
+
+				util.WriteError(r.Context(), status.Errorf(status.PermissionDenied, "only users with admin power can perform this operation"), w)
 				return
 			}
 		}
