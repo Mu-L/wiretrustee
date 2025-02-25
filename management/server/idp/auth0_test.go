@@ -1,14 +1,19 @@
 package idp
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/stretchr/testify/require"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/netbirdio/netbird/management/server/telemetry"
 
 	"github.com/golang-jwt/jwt"
 	"github.com/stretchr/testify/assert"
@@ -22,13 +27,13 @@ type mockHTTPClient struct {
 }
 
 func (c *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	body, err := ioutil.ReadAll(req.Body)
+	body, err := io.ReadAll(req.Body)
 	if err == nil {
 		c.reqBody = string(body)
 	}
 	return &http.Response{
 		StatusCode: c.code,
-		Body:       ioutil.NopCloser(strings.NewReader(c.resBody)),
+		Body:       io.NopCloser(strings.NewReader(c.resBody)),
 	}, c.err
 }
 
@@ -40,14 +45,14 @@ type mockJsonParser struct {
 
 func (m *mockJsonParser) Marshal(v interface{}) ([]byte, error) {
 	if m.marshalErrorString != "" {
-		return nil, fmt.Errorf(m.marshalErrorString)
+		return nil, errors.New(m.marshalErrorString)
 	}
 	return m.jsonParser.Marshal(v)
 }
 
 func (m *mockJsonParser) Unmarshal(data []byte, v interface{}) error {
 	if m.unmarshalErrorString != "" {
-		return fmt.Errorf(m.unmarshalErrorString)
+		return errors.New(m.unmarshalErrorString)
 	}
 	return m.jsonParser.Unmarshal(data, v)
 }
@@ -57,11 +62,12 @@ type mockAuth0Credentials struct {
 	err      error
 }
 
-func (mc *mockAuth0Credentials) Authenticate() (JWTToken, error) {
+func (mc *mockAuth0Credentials) Authenticate(_ context.Context) (JWTToken, error) {
 	return mc.jwtToken, mc.err
 }
 
 func newTestJWT(t *testing.T, expInt int) string {
+	t.Helper()
 	now := time.Now()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"iat": now.Unix(),
@@ -122,7 +128,7 @@ func TestAuth0_RequestJWTToken(t *testing.T) {
 				helper:       testCase.helper,
 			}
 
-			res, err := creds.requestJWTToken()
+			res, err := creds.requestJWTToken(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -130,7 +136,8 @@ func TestAuth0_RequestJWTToken(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			body, err := ioutil.ReadAll(res.Body)
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
 			assert.NoError(t, err, "unable to read the response body")
 
 			jwtToken := JWTToken{}
@@ -178,7 +185,7 @@ func TestAuth0_ParseRequestJWTResponse(t *testing.T) {
 	for _, testCase := range []parseRequestJWTResponseTest{parseRequestJWTResponseTestCase1, parseRequestJWTResponseTestCase2} {
 		t.Run(testCase.name, func(t *testing.T) {
 
-			rawBody := ioutil.NopCloser(strings.NewReader(testCase.inputResBody))
+			rawBody := io.NopCloser(strings.NewReader(testCase.inputResBody))
 
 			config := Auth0ClientConfig{}
 
@@ -250,7 +257,7 @@ func TestAuth0_Authenticate(t *testing.T) {
 		name:             "Get Cached token",
 		inputExpireToken: time.Now().Add(30 * time.Second),
 		helper:           JsonParser{},
-		//expectedFuncExitErrDiff: fmt.Errorf("unable to get token, statusCode 400"),
+		// expectedFuncExitErrDiff: fmt.Errorf("unable to get token, statusCode 400"),
 		expectedCode:  200,
 		expectedToken: "",
 	}
@@ -290,7 +297,7 @@ func TestAuth0_Authenticate(t *testing.T) {
 
 			creds.jwtToken.expiresInTime = testCase.inputExpireToken
 
-			_, err := creds.Authenticate()
+			_, err := creds.Authenticate(context.Background())
 			if err != nil {
 				if testCase.expectedFuncExitErrDiff != nil {
 					assert.EqualError(t, err, testCase.expectedFuncExitErrDiff.Error(), "errors should be the same")
@@ -320,7 +327,7 @@ func TestAuth0_UpdateUserAppMetadata(t *testing.T) {
 
 	exp := 15
 	token := newTestJWT(t, exp)
-	appMetadata := AppMetadata{WTAccountId: "ok"}
+	appMetadata := AppMetadata{WTAccountID: "ok"}
 
 	updateUserAppMetadataTestCase1 := updateUserAppMetadataTest{
 		name:            "Bad Authentication",
@@ -340,7 +347,7 @@ func TestAuth0_UpdateUserAppMetadata(t *testing.T) {
 	updateUserAppMetadataTestCase2 := updateUserAppMetadataTest{
 		name:            "Bad Status Code",
 		inputReqBody:    fmt.Sprintf("{\"access_token\":\"%s\",\"scope\":\"read:users\",\"expires_in\":%d,\"token_type\":\"Bearer\"}", token, exp),
-		expectedReqBody: fmt.Sprintf("{\"app_metadata\": {\"wt_account_id\":\"%s\"}}", appMetadata.WTAccountId),
+		expectedReqBody: fmt.Sprintf("{\"app_metadata\":{\"wt_account_id\":\"%s\"}}", appMetadata.WTAccountID),
 		appMetadata:     appMetadata,
 		statusCode:      400,
 		helper:          JsonParser{},
@@ -363,7 +370,7 @@ func TestAuth0_UpdateUserAppMetadata(t *testing.T) {
 	updateUserAppMetadataTestCase4 := updateUserAppMetadataTest{
 		name:                 "Good request",
 		inputReqBody:         fmt.Sprintf("{\"access_token\":\"%s\",\"scope\":\"read:users\",\"expires_in\":%d,\"token_type\":\"Bearer\"}", token, exp),
-		expectedReqBody:      fmt.Sprintf("{\"app_metadata\": {\"wt_account_id\":\"%s\"}}", appMetadata.WTAccountId),
+		expectedReqBody:      fmt.Sprintf("{\"app_metadata\":{\"wt_account_id\":\"%s\"}}", appMetadata.WTAccountID),
 		appMetadata:          appMetadata,
 		statusCode:           200,
 		helper:               JsonParser{},
@@ -371,7 +378,23 @@ func TestAuth0_UpdateUserAppMetadata(t *testing.T) {
 		assertErrFuncMessage: "shouldn't return error",
 	}
 
-	for _, testCase := range []updateUserAppMetadataTest{updateUserAppMetadataTestCase1, updateUserAppMetadataTestCase2, updateUserAppMetadataTestCase3, updateUserAppMetadataTestCase4} {
+	invite := true
+	updateUserAppMetadataTestCase5 := updateUserAppMetadataTest{
+		name:            "Update Pending Invite",
+		inputReqBody:    fmt.Sprintf("{\"access_token\":\"%s\",\"scope\":\"read:users\",\"expires_in\":%d,\"token_type\":\"Bearer\"}", token, exp),
+		expectedReqBody: fmt.Sprintf("{\"app_metadata\":{\"wt_account_id\":\"%s\",\"wt_pending_invite\":true}}", appMetadata.WTAccountID),
+		appMetadata: AppMetadata{
+			WTAccountID:     "ok",
+			WTPendingInvite: &invite,
+		},
+		statusCode:           200,
+		helper:               JsonParser{},
+		assertErrFunc:        assert.NoError,
+		assertErrFuncMessage: "shouldn't return error",
+	}
+
+	for _, testCase := range []updateUserAppMetadataTest{updateUserAppMetadataTestCase1, updateUserAppMetadataTestCase2,
+		updateUserAppMetadataTestCase3, updateUserAppMetadataTestCase4, updateUserAppMetadataTestCase5} {
 		t.Run(testCase.name, func(t *testing.T) {
 			jwtReqClient := mockHTTPClient{
 				resBody: testCase.inputReqBody,
@@ -396,7 +419,7 @@ func TestAuth0_UpdateUserAppMetadata(t *testing.T) {
 				helper:      testCase.helper,
 			}
 
-			err := manager.UpdateUserAppMetadata("1", testCase.appMetadata)
+			err := manager.UpdateUserAppMetadata(context.Background(), "1", testCase.appMetadata)
 			testCase.assertErrFunc(t, err, testCase.assertErrFuncMessage)
 
 			assert.Equal(t, testCase.expectedReqBody, jwtReqClient.reqBody, "request body should match")
@@ -440,26 +463,9 @@ func TestNewAuth0Manager(t *testing.T) {
 	testCase3Config := defaultTestConfig
 	testCase3Config.AuthIssuer = "abc-auth0.eu.auth0.com"
 
-	testCase3 := test{
-		name:                 "Wrong Auth Issuer Format",
-		inputConfig:          testCase3Config,
-		assertErrFunc:        require.Error,
-		assertErrFuncMessage: "should return error when wrong auth issuer format",
-	}
-
-	testCase4Config := defaultTestConfig
-	testCase4Config.GrantType = "spa"
-
-	testCase4 := test{
-		name:                 "Wrong Grant Type",
-		inputConfig:          testCase4Config,
-		assertErrFunc:        require.Error,
-		assertErrFuncMessage: "should return error when wrong grant type",
-	}
-
-	for _, testCase := range []test{testCase1, testCase2, testCase3, testCase4} {
+	for _, testCase := range []test{testCase1, testCase2} {
 		t.Run(testCase.name, func(t *testing.T) {
-			_, err := NewAuth0Manager(testCase.inputConfig)
+			_, err := NewAuth0Manager(testCase.inputConfig, &telemetry.MockAppMetrics{})
 			testCase.assertErrFunc(t, err, testCase.assertErrFuncMessage)
 		})
 	}

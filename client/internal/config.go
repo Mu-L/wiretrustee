@@ -2,153 +2,557 @@ package internal
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	mgm "github.com/netbirdio/netbird/management/client"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"net/url"
 	"os"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"time"
 
-	"github.com/netbirdio/netbird/iface"
-	"github.com/netbirdio/netbird/util"
 	log "github.com/sirupsen/logrus"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/netbirdio/netbird/client/iface"
+	"github.com/netbirdio/netbird/client/internal/routemanager/dynamic"
+	"github.com/netbirdio/netbird/client/ssh"
+	mgm "github.com/netbirdio/netbird/management/client"
+	"github.com/netbirdio/netbird/management/domain"
+	"github.com/netbirdio/netbird/util"
 )
 
-var managementURLDefault *url.URL
+const (
+	// managementLegacyPortString is the port that was used before by the Management gRPC server.
+	// It is used for backward compatibility now.
+	// NB: hardcoded from github.com/netbirdio/netbird/management/cmd to avoid import
+	managementLegacyPortString = "33073"
+	// DefaultManagementURL points to the NetBird's cloud management endpoint
+	DefaultManagementURL = "https://api.netbird.io:443"
+	// oldDefaultManagementURL points to the NetBird's old cloud management endpoint
+	oldDefaultManagementURL = "https://api.wiretrustee.com:443"
+	// DefaultAdminURL points to NetBird's cloud management console
+	DefaultAdminURL = "https://app.netbird.io:443"
+)
 
-func ManagementURLDefault() *url.URL {
-	return managementURLDefault
+var defaultInterfaceBlacklist = []string{
+	iface.WgInterfaceDefault, "wt", "utun", "tun0", "zt", "ZeroTier", "wg", "ts",
+	"Tailscale", "tailscale", "docker", "veth", "br-", "lo",
 }
 
-func init() {
-	managementURL, err := parseURL("Management URL", "https://api.wiretrustee.com:33073")
-	if err != nil {
-		panic(err)
-	}
-	managementURLDefault = managementURL
+// ConfigInput carries configuration changes to the client
+type ConfigInput struct {
+	ManagementURL       string
+	AdminURL            string
+	ConfigPath          string
+	StateFilePath       string
+	PreSharedKey        *string
+	ServerSSHAllowed    *bool
+	NATExternalIPs      []string
+	CustomDNSAddress    []byte
+	RosenpassEnabled    *bool
+	RosenpassPermissive *bool
+	InterfaceName       *string
+	WireguardPort       *int
+	NetworkMonitor      *bool
+	DisableAutoConnect  *bool
+	ExtraIFaceBlackList []string
+	DNSRouteInterval    *time.Duration
+	ClientCertPath      string
+	ClientCertKeyPath   string
+
+	DisableClientRoutes *bool
+	DisableServerRoutes *bool
+	DisableDNS          *bool
+	DisableFirewall     *bool
+
+	BlockLANAccess *bool
+
+	DisableNotifications *bool
+
+	DNSLabels domain.List
 }
 
 // Config Configuration type
 type Config struct {
 	// Wireguard private key of local peer
-	PrivateKey     string
-	PreSharedKey   string
-	ManagementURL  *url.URL
-	AdminURL       *url.URL
-	WgIface        string
-	IFaceBlackList []string
+	PrivateKey           string
+	PreSharedKey         string
+	ManagementURL        *url.URL
+	AdminURL             *url.URL
+	WgIface              string
+	WgPort               int
+	NetworkMonitor       *bool
+	IFaceBlackList       []string
+	DisableIPv6Discovery bool
+	RosenpassEnabled     bool
+	RosenpassPermissive  bool
+	ServerSSHAllowed     *bool
+
+	DisableClientRoutes bool
+	DisableServerRoutes bool
+	DisableDNS          bool
+	DisableFirewall     bool
+
+	BlockLANAccess bool
+
+	DisableNotifications *bool
+
+	DNSLabels domain.List
+
+	// SSHKey is a private SSH key in a PEM format
+	SSHKey string
+
+	// ExternalIP mappings, if different from the host interface IP
+	//
+	//   External IP must not be behind a CGNAT and port-forwarding for incoming UDP packets from WgPort on ExternalIP
+	//   to WgPort on host interface IP must be present. This can take form of single port-forwarding rule, 1:1 DNAT
+	//   mapping ExternalIP to host interface IP, or a NAT DMZ to host interface IP.
+	//
+	//   A single mapping will take the form of: external[/internal]
+	//    external (required): either the external IP address or "stun" to use STUN to determine the external IP address
+	//    internal (optional): either the internal/interface IP address or an interface name
+	//
+	//   examples:
+	//      "12.34.56.78"          => all interfaces IPs will be mapped to external IP of 12.34.56.78
+	//      "12.34.56.78/eth0"     => IPv4 assigned to interface eth0 will be mapped to external IP of 12.34.56.78
+	//      "12.34.56.78/10.1.2.3" => interface IP 10.1.2.3 will be mapped to external IP of 12.34.56.78
+
+	NATExternalIPs []string
+	// CustomDNSAddress sets the DNS resolver listening address in format ip:port
+	CustomDNSAddress string
+
+	// DisableAutoConnect determines whether the client should not start with the service
+	// it's set to false by default due to backwards compatibility
+	DisableAutoConnect bool
+
+	// DNSRouteInterval is the interval in which the DNS routes are updated
+	DNSRouteInterval time.Duration
+	// Path to a certificate used for mTLS authentication
+	ClientCertPath string
+
+	// Path to corresponding private key of ClientCertPath
+	ClientCertKeyPath string
+
+	ClientCertKeyPair *tls.Certificate `json:"-"`
 }
 
-// createNewConfig creates a new config generating a new Wireguard key and saving to file
-func createNewConfig(managementURL, adminURL, configPath, preSharedKey string) (*Config, error) {
-	wgKey := generateKey()
-	config := &Config{PrivateKey: wgKey, WgIface: iface.WgInterfaceDefault, IFaceBlackList: []string{}}
-	if managementURL != "" {
-		URL, err := parseURL("Management URL", managementURL)
+// ReadConfig read config file and return with Config. If it is not exists create a new with default values
+func ReadConfig(configPath string) (*Config, error) {
+	if fileExists(configPath) {
+		err := util.EnforcePermission(configPath)
+		if err != nil {
+			log.Errorf("failed to enforce permission on config dir: %v", err)
+		}
+
+		config := &Config{}
+		if _, err := util.ReadJson(configPath, config); err != nil {
+			return nil, err
+		}
+		// initialize through apply() without changes
+		if changed, err := config.apply(ConfigInput{}); err != nil {
+			return nil, err
+		} else if changed {
+			if err = WriteOutConfig(configPath, config); err != nil {
+				return nil, err
+			}
+		}
+
+		return config, nil
+	}
+
+	cfg, err := createNewConfig(ConfigInput{ConfigPath: configPath})
+	if err != nil {
+		return nil, err
+	}
+
+	err = WriteOutConfig(configPath, cfg)
+	return cfg, err
+}
+
+// UpdateConfig update existing configuration according to input configuration and return with the configuration
+func UpdateConfig(input ConfigInput) (*Config, error) {
+	if !fileExists(input.ConfigPath) {
+		return nil, status.Errorf(codes.NotFound, "config file doesn't exist")
+	}
+
+	return update(input)
+}
+
+// UpdateOrCreateConfig reads existing config or generates a new one
+func UpdateOrCreateConfig(input ConfigInput) (*Config, error) {
+	if !fileExists(input.ConfigPath) {
+		log.Infof("generating new config %s", input.ConfigPath)
+		cfg, err := createNewConfig(input)
 		if err != nil {
 			return nil, err
 		}
-		config.ManagementURL = URL
-	} else {
-		config.ManagementURL = managementURLDefault
+		err = util.WriteJsonWithRestrictedPermission(context.Background(), input.ConfigPath, cfg)
+		return cfg, err
 	}
 
-	if preSharedKey != "" {
-		config.PreSharedKey = preSharedKey
+	if isPreSharedKeyHidden(input.PreSharedKey) {
+		input.PreSharedKey = nil
 	}
-
-	config.IFaceBlackList = []string{iface.WgInterfaceDefault, "tun0"}
-
-	err := util.WriteJson(configPath, config)
+	err := util.EnforcePermission(input.ConfigPath)
 	if err != nil {
+		log.Errorf("failed to enforce permission on config dir: %v", err)
+	}
+	return update(input)
+}
+
+// CreateInMemoryConfig generate a new config but do not write out it to the store
+func CreateInMemoryConfig(input ConfigInput) (*Config, error) {
+	return createNewConfig(input)
+}
+
+// WriteOutConfig write put the prepared config to the given path
+func WriteOutConfig(path string, config *Config) error {
+	return util.WriteJson(context.Background(), path, config)
+}
+
+// createNewConfig creates a new config generating a new Wireguard key and saving to file
+func createNewConfig(input ConfigInput) (*Config, error) {
+	config := &Config{
+		// defaults to false only for new (post 0.26) configurations
+		ServerSSHAllowed: util.False(),
+	}
+
+	if _, err := config.apply(input); err != nil {
 		return nil, err
 	}
 
 	return config, nil
 }
 
-func parseURL(serviceName, managementURL string) (*url.URL, error) {
-	parsedMgmtURL, err := url.ParseRequestURI(managementURL)
+func update(input ConfigInput) (*Config, error) {
+	config := &Config{}
+
+	if _, err := util.ReadJson(input.ConfigPath, config); err != nil {
+		return nil, err
+	}
+
+	updated, err := config.apply(input)
 	if err != nil {
-		log.Errorf("failed parsing management URL %s: [%s]", managementURL, err.Error())
+		return nil, err
+	}
+
+	if updated {
+		if err := util.WriteJson(context.Background(), input.ConfigPath, config); err != nil {
+			return nil, err
+		}
+	}
+
+	return config, nil
+}
+
+func (config *Config) apply(input ConfigInput) (updated bool, err error) {
+	if config.ManagementURL == nil {
+		log.Infof("using default Management URL %s", DefaultManagementURL)
+		config.ManagementURL, err = parseURL("Management URL", DefaultManagementURL)
+		if err != nil {
+			return false, err
+		}
+	}
+	if input.ManagementURL != "" && input.ManagementURL != config.ManagementURL.String() {
+		log.Infof("new Management URL provided, updated to %#v (old value %#v)",
+			input.ManagementURL, config.ManagementURL.String())
+		URL, err := parseURL("Management URL", input.ManagementURL)
+		if err != nil {
+			return false, err
+		}
+		config.ManagementURL = URL
+		updated = true
+	} else if config.ManagementURL == nil {
+		log.Infof("using default Management URL %s", DefaultManagementURL)
+		config.ManagementURL, err = parseURL("Management URL", DefaultManagementURL)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	if config.AdminURL == nil {
+		log.Infof("using default Admin URL %s", DefaultManagementURL)
+		config.AdminURL, err = parseURL("Admin URL", DefaultAdminURL)
+		if err != nil {
+			return false, err
+		}
+	}
+	if input.AdminURL != "" && input.AdminURL != config.AdminURL.String() {
+		log.Infof("new Admin Panel URL provided, updated to %#v (old value %#v)",
+			input.AdminURL, config.AdminURL.String())
+		newURL, err := parseURL("Admin Panel URL", input.AdminURL)
+		if err != nil {
+			return updated, err
+		}
+		config.AdminURL = newURL
+		updated = true
+	}
+
+	if config.PrivateKey == "" {
+		log.Infof("generated new Wireguard key")
+		config.PrivateKey = generateKey()
+		updated = true
+	}
+
+	if config.SSHKey == "" {
+		log.Infof("generated new SSH key")
+		pem, err := ssh.GeneratePrivateKey(ssh.ED25519)
+		if err != nil {
+			return false, err
+		}
+		config.SSHKey = string(pem)
+		updated = true
+	}
+
+	if input.WireguardPort != nil && *input.WireguardPort != config.WgPort {
+		log.Infof("updating Wireguard port %d (old value %d)",
+			*input.WireguardPort, config.WgPort)
+		config.WgPort = *input.WireguardPort
+		updated = true
+	} else if config.WgPort == 0 {
+		config.WgPort = iface.DefaultWgPort
+		log.Infof("using default Wireguard port %d", config.WgPort)
+		updated = true
+	}
+
+	if input.InterfaceName != nil && *input.InterfaceName != config.WgIface {
+		log.Infof("updating Wireguard interface %#v (old value %#v)",
+			*input.InterfaceName, config.WgIface)
+		config.WgIface = *input.InterfaceName
+		updated = true
+	} else if config.WgIface == "" {
+		config.WgIface = iface.WgInterfaceDefault
+		log.Infof("using default Wireguard interface %s", config.WgIface)
+		updated = true
+	}
+
+	if input.NATExternalIPs != nil && !reflect.DeepEqual(config.NATExternalIPs, input.NATExternalIPs) {
+		log.Infof("updating NAT External IP [ %s ] (old value: [ %s ])",
+			strings.Join(input.NATExternalIPs, " "),
+			strings.Join(config.NATExternalIPs, " "))
+		config.NATExternalIPs = input.NATExternalIPs
+		updated = true
+	}
+
+	if input.PreSharedKey != nil && *input.PreSharedKey != config.PreSharedKey {
+		log.Infof("new pre-shared key provided, replacing old key")
+		config.PreSharedKey = *input.PreSharedKey
+		updated = true
+	}
+
+	if input.RosenpassEnabled != nil && *input.RosenpassEnabled != config.RosenpassEnabled {
+		log.Infof("switching Rosenpass to %t", *input.RosenpassEnabled)
+		config.RosenpassEnabled = *input.RosenpassEnabled
+		updated = true
+	}
+
+	if input.RosenpassPermissive != nil && *input.RosenpassPermissive != config.RosenpassPermissive {
+		log.Infof("switching Rosenpass permissive to %t", *input.RosenpassPermissive)
+		config.RosenpassPermissive = *input.RosenpassPermissive
+		updated = true
+	}
+
+	if input.NetworkMonitor != nil && input.NetworkMonitor != config.NetworkMonitor {
+		log.Infof("switching Network Monitor to %t", *input.NetworkMonitor)
+		config.NetworkMonitor = input.NetworkMonitor
+		updated = true
+	}
+
+	if config.NetworkMonitor == nil {
+		// enable network monitoring by default on windows and darwin clients
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+			enabled := true
+			config.NetworkMonitor = &enabled
+			updated = true
+		}
+	}
+
+	if input.CustomDNSAddress != nil && string(input.CustomDNSAddress) != config.CustomDNSAddress {
+		log.Infof("updating custom DNS address %#v (old value %#v)",
+			string(input.CustomDNSAddress), config.CustomDNSAddress)
+		config.CustomDNSAddress = string(input.CustomDNSAddress)
+		updated = true
+	}
+
+	if len(config.IFaceBlackList) == 0 {
+		log.Infof("filling in interface blacklist with defaults: [ %s ]",
+			strings.Join(defaultInterfaceBlacklist, " "))
+		config.IFaceBlackList = append(config.IFaceBlackList, defaultInterfaceBlacklist...)
+		updated = true
+	}
+
+	if len(input.ExtraIFaceBlackList) > 0 {
+		for _, iFace := range util.SliceDiff(input.ExtraIFaceBlackList, config.IFaceBlackList) {
+			log.Infof("adding new entry to interface blacklist: %s", iFace)
+			config.IFaceBlackList = append(config.IFaceBlackList, iFace)
+			updated = true
+		}
+	}
+
+	if input.DisableAutoConnect != nil && *input.DisableAutoConnect != config.DisableAutoConnect {
+		if *input.DisableAutoConnect {
+			log.Infof("turning off automatic connection on startup")
+		} else {
+			log.Infof("enabling automatic connection on startup")
+		}
+		config.DisableAutoConnect = *input.DisableAutoConnect
+		updated = true
+	}
+
+	if input.ServerSSHAllowed != nil && *input.ServerSSHAllowed != *config.ServerSSHAllowed {
+		if *input.ServerSSHAllowed {
+			log.Infof("enabling SSH server")
+		} else {
+			log.Infof("disabling SSH server")
+		}
+		config.ServerSSHAllowed = input.ServerSSHAllowed
+		updated = true
+	} else if config.ServerSSHAllowed == nil {
+		// enables SSH for configs from old versions to preserve backwards compatibility
+		log.Infof("falling back to enabled SSH server for pre-existing configuration")
+		config.ServerSSHAllowed = util.True()
+		updated = true
+	}
+
+	if input.DNSRouteInterval != nil && *input.DNSRouteInterval != config.DNSRouteInterval {
+		log.Infof("updating DNS route interval to %s (old value %s)",
+			input.DNSRouteInterval.String(), config.DNSRouteInterval.String())
+		config.DNSRouteInterval = *input.DNSRouteInterval
+		updated = true
+	} else if config.DNSRouteInterval == 0 {
+		config.DNSRouteInterval = dynamic.DefaultInterval
+		log.Infof("using default DNS route interval %s", config.DNSRouteInterval)
+		updated = true
+	}
+
+	if input.DisableClientRoutes != nil && *input.DisableClientRoutes != config.DisableClientRoutes {
+		if *input.DisableClientRoutes {
+			log.Infof("disabling client routes")
+		} else {
+			log.Infof("enabling client routes")
+		}
+		config.DisableClientRoutes = *input.DisableClientRoutes
+		updated = true
+	}
+
+	if input.DisableServerRoutes != nil && *input.DisableServerRoutes != config.DisableServerRoutes {
+		if *input.DisableServerRoutes {
+			log.Infof("disabling server routes")
+		} else {
+			log.Infof("enabling server routes")
+		}
+		config.DisableServerRoutes = *input.DisableServerRoutes
+		updated = true
+	}
+
+	if input.DisableDNS != nil && *input.DisableDNS != config.DisableDNS {
+		if *input.DisableDNS {
+			log.Infof("disabling DNS configuration")
+		} else {
+			log.Infof("enabling DNS configuration")
+		}
+		config.DisableDNS = *input.DisableDNS
+		updated = true
+	}
+
+	if input.DisableFirewall != nil && *input.DisableFirewall != config.DisableFirewall {
+		if *input.DisableFirewall {
+			log.Infof("disabling firewall configuration")
+		} else {
+			log.Infof("enabling firewall configuration")
+		}
+		config.DisableFirewall = *input.DisableFirewall
+		updated = true
+	}
+
+	if input.BlockLANAccess != nil && *input.BlockLANAccess != config.BlockLANAccess {
+		if *input.BlockLANAccess {
+			log.Infof("blocking LAN access")
+		} else {
+			log.Infof("allowing LAN access")
+		}
+		config.BlockLANAccess = *input.BlockLANAccess
+		updated = true
+	}
+
+	if input.DisableNotifications != nil && input.DisableNotifications != config.DisableNotifications {
+		if *input.DisableNotifications {
+			log.Infof("disabling notifications")
+		} else {
+			log.Infof("enabling notifications")
+		}
+		config.DisableNotifications = input.DisableNotifications
+		updated = true
+	}
+
+	if config.DisableNotifications == nil {
+		disabled := true
+		config.DisableNotifications = &disabled
+		log.Infof("setting notifications to disabled by default")
+		updated = true
+	}
+
+	if input.ClientCertKeyPath != "" {
+		config.ClientCertKeyPath = input.ClientCertKeyPath
+		updated = true
+	}
+
+	if input.ClientCertPath != "" {
+		config.ClientCertPath = input.ClientCertPath
+		updated = true
+	}
+
+	if config.ClientCertPath != "" && config.ClientCertKeyPath != "" {
+		cert, err := tls.LoadX509KeyPair(config.ClientCertPath, config.ClientCertKeyPath)
+		if err != nil {
+			log.Error("Failed to load mTLS cert/key pair: ", err)
+		} else {
+			config.ClientCertKeyPair = &cert
+			log.Info("Loaded client mTLS cert/key pair")
+		}
+	}
+
+	if input.DNSLabels != nil && !slices.Equal(config.DNSLabels, input.DNSLabels) {
+		log.Infof("updating DNS labels [ %s ] (old value: [ %s ])",
+			input.DNSLabels.SafeString(),
+			config.DNSLabels.SafeString())
+		config.DNSLabels = input.DNSLabels
+		updated = true
+	}
+
+	return updated, nil
+}
+
+// parseURL parses and validates a service URL
+func parseURL(serviceName, serviceURL string) (*url.URL, error) {
+	parsedMgmtURL, err := url.ParseRequestURI(serviceURL)
+	if err != nil {
+		log.Errorf("failed parsing %s URL %s: [%s]", serviceName, serviceURL, err.Error())
 		return nil, err
 	}
 
 	if parsedMgmtURL.Scheme != "https" && parsedMgmtURL.Scheme != "http" {
 		return nil, fmt.Errorf(
 			"invalid %s URL provided %s. Supported format [http|https]://[host]:[port]",
-			serviceName, managementURL)
+			serviceName, serviceURL)
+	}
+
+	if parsedMgmtURL.Port() == "" {
+		switch parsedMgmtURL.Scheme {
+		case "https":
+			parsedMgmtURL.Host += ":443"
+		case "http":
+			parsedMgmtURL.Host += ":80"
+		default:
+			log.Infof("unable to determine a default port for schema %s in URL %s", parsedMgmtURL.Scheme, serviceURL)
+		}
 	}
 
 	return parsedMgmtURL, err
-}
-
-// ReadConfig reads existing config. In case provided managementURL is not empty overrides the read property
-func ReadConfig(managementURL, adminURL, configPath string, preSharedKey *string) (*Config, error) {
-	config := &Config{}
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return nil, status.Errorf(codes.NotFound, "config file doesn't exist")
-	}
-
-	if _, err := util.ReadJson(configPath, config); err != nil {
-		return nil, err
-	}
-
-	refresh := false
-
-	if managementURL != "" && config.ManagementURL.String() != managementURL {
-		log.Infof("new Management URL provided, updated to %s (old value %s)",
-			managementURL, config.ManagementURL)
-		newURL, err := parseURL("Management URL", managementURL)
-		if err != nil {
-			return nil, err
-		}
-		config.ManagementURL = newURL
-		refresh = true
-	}
-
-	if adminURL != "" && (config.AdminURL == nil || config.AdminURL.String() != adminURL) {
-		log.Infof("new Admin Panel URL provided, updated to %s (old value %s)",
-			adminURL, config.AdminURL)
-		newURL, err := parseURL("Admin Panel URL", adminURL)
-		if err != nil {
-			return nil, err
-		}
-		config.AdminURL = newURL
-		refresh = true
-	}
-
-	if preSharedKey != nil && config.PreSharedKey != *preSharedKey {
-		log.Infof("new pre-shared key provided, updated to %s (old value %s)",
-			*preSharedKey, config.PreSharedKey)
-		config.PreSharedKey = *preSharedKey
-		refresh = true
-	}
-
-	if refresh {
-		// since we have new management URL, we need to update config file
-		if err := util.WriteJson(configPath, config); err != nil {
-			return nil, err
-		}
-	}
-
-	return config, nil
-}
-
-// GetConfig reads existing config or generates a new one
-func GetConfig(managementURL, adminURL, configPath, preSharedKey string) (*Config, error) {
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		log.Infof("generating new config %s", configPath)
-		return createNewConfig(managementURL, adminURL, configPath, preSharedKey)
-	} else {
-		// don't overwrite pre-shared key if we receive asterisks from UI
-		pk := &preSharedKey
-		if preSharedKey == "**********" {
-			pk = nil
-		}
-		return ReadConfig(managementURL, adminURL, configPath, pk)
-	}
 }
 
 // generateKey generates a new Wireguard private key
@@ -160,30 +564,45 @@ func generateKey() string {
 	return key.String()
 }
 
-// DeviceAuthorizationFlow represents Device Authorization Flow information
-type DeviceAuthorizationFlow struct {
-	Provider       string
-	ProviderConfig ProviderConfig
+// don't overwrite pre-shared key if we receive asterisks from UI
+func isPreSharedKeyHidden(preSharedKey *string) bool {
+	if preSharedKey != nil && *preSharedKey == "**********" {
+		return true
+	}
+	return false
 }
 
-// ProviderConfig has all attributes needed to initiate a device authorization flow
-type ProviderConfig struct {
-	// ClientID An IDP application client id
-	ClientID string
-	// ClientSecret An IDP application client secret
-	ClientSecret string
-	// Domain An IDP API domain
-	Domain string
-	// Audience An Audience for to authorization validation
-	Audience string
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return !os.IsNotExist(err)
 }
 
-func GetDeviceAuthorizationFlowInfo(ctx context.Context, config *Config) (DeviceAuthorizationFlow, error) {
-	// validate our peer's Wireguard PRIVATE key
-	myPrivateKey, err := wgtypes.ParseKey(config.PrivateKey)
+func createFile(path string) error {
+	file, err := os.Create(path)
 	if err != nil {
-		log.Errorf("failed parsing Wireguard key %s: [%s]", config.PrivateKey, err.Error())
-		return DeviceAuthorizationFlow{}, err
+		return err
+	}
+	return file.Close()
+}
+
+// UpdateOldManagementURL checks whether client can switch to the new Management URL with port 443 and the management domain.
+// If it can switch, then it updates the config and returns a new one. Otherwise, it returns the provided config.
+// The check is performed only for the NetBird's managed version.
+func UpdateOldManagementURL(ctx context.Context, config *Config, configPath string) (*Config, error) {
+	defaultManagementURL, err := parseURL("Management URL", DefaultManagementURL)
+	if err != nil {
+		return nil, err
+	}
+
+	parsedOldDefaultManagementURL, err := parseURL("Management URL", oldDefaultManagementURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if config.ManagementURL.Hostname() != defaultManagementURL.Hostname() &&
+		config.ManagementURL.Hostname() != parsedOldDefaultManagementURL.Hostname() {
+		// only do the check for the NetBird's managed version
+		return config, nil
 	}
 
 	var mgmTlsEnabled bool
@@ -191,45 +610,59 @@ func GetDeviceAuthorizationFlowInfo(ctx context.Context, config *Config) (Device
 		mgmTlsEnabled = true
 	}
 
-	log.Debugf("connecting to Management Service %s", config.ManagementURL.String())
-	mgmClient, err := mgm.NewClient(ctx, config.ManagementURL.Host, myPrivateKey, mgmTlsEnabled)
-	if err != nil {
-		log.Errorf("failed connecting to Management Service %s %v", config.ManagementURL.String(), err)
-		return DeviceAuthorizationFlow{}, err
-	}
-	log.Debugf("connected to management Service %s", config.ManagementURL.String())
-
-	serverKey, err := mgmClient.GetServerPublicKey()
-	if err != nil {
-		log.Errorf("failed while getting Management Service public key: %v", err)
-		return DeviceAuthorizationFlow{}, err
+	if !mgmTlsEnabled {
+		// only do the check for HTTPs scheme (the hosted version of the Management service is always HTTPs)
+		return config, nil
 	}
 
-	protoDeviceAuthorizationFlow, err := mgmClient.GetDeviceAuthorizationFlow(*serverKey)
+	if config.ManagementURL.Port() != managementLegacyPortString &&
+		config.ManagementURL.Hostname() == defaultManagementURL.Hostname() {
+		return config, nil
+	}
+
+	newURL, err := parseURL("Management URL", fmt.Sprintf("%s://%s:%d",
+		config.ManagementURL.Scheme, defaultManagementURL.Hostname(), 443))
 	if err != nil {
-		if s, ok := status.FromError(err); ok && s.Code() == codes.NotFound {
-			log.Warnf("server couldn't find device flow, contact admin: %v", err)
-			return DeviceAuthorizationFlow{}, err
-		} else {
-			log.Errorf("failed to retrieve device flow: %v", err)
-			return DeviceAuthorizationFlow{}, err
+		return nil, err
+	}
+	// here we check whether we could switch from the legacy 33073 port to the new 443
+	log.Infof("attempting to switch from the legacy Management URL %s to the new one %s",
+		config.ManagementURL.String(), newURL.String())
+	key, err := wgtypes.ParseKey(config.PrivateKey)
+	if err != nil {
+		log.Infof("couldn't switch to the new Management %s", newURL.String())
+		return config, err
+	}
+
+	client, err := mgm.NewClient(ctx, newURL.Host, key, mgmTlsEnabled)
+	if err != nil {
+		log.Infof("couldn't switch to the new Management %s", newURL.String())
+		return config, err
+	}
+	defer func() {
+		err = client.Close()
+		if err != nil {
+			log.Warnf("failed to close the Management service client %v", err)
 		}
-	}
+	}()
 
-	err = mgmClient.Close()
+	// gRPC check
+	_, err = client.GetServerPublicKey()
 	if err != nil {
-		log.Errorf("failed closing Management Service client: %v", err)
-		return DeviceAuthorizationFlow{}, err
+		log.Infof("couldn't switch to the new Management %s", newURL.String())
+		return nil, err
 	}
 
-	return DeviceAuthorizationFlow{
-		Provider: protoDeviceAuthorizationFlow.Provider.String(),
+	// everything is alright => update the config
+	newConfig, err := UpdateConfig(ConfigInput{
+		ManagementURL: newURL.String(),
+		ConfigPath:    configPath,
+	})
+	if err != nil {
+		log.Infof("couldn't switch to the new Management %s", newURL.String())
+		return config, fmt.Errorf("failed updating config file: %v", err)
+	}
+	log.Infof("successfully switched to the new Management URL: %s", newURL.String())
 
-		ProviderConfig: ProviderConfig{
-			Audience:     protoDeviceAuthorizationFlow.ProviderConfig.Audience,
-			ClientID:     protoDeviceAuthorizationFlow.ProviderConfig.ClientID,
-			ClientSecret: protoDeviceAuthorizationFlow.ProviderConfig.ClientSecret,
-			Domain:       protoDeviceAuthorizationFlow.ProviderConfig.Domain,
-		},
-	}, nil
+	return newConfig, nil
 }
